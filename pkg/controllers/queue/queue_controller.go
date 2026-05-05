@@ -45,6 +45,7 @@ import (
 	schedulinglister "volcano.sh/apis/pkg/client/listers/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 	"volcano.sh/volcano/pkg/controllers/framework"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	queuestate "volcano.sh/volcano/pkg/controllers/queue/state"
 	"volcano.sh/volcano/pkg/features"
 )
@@ -59,12 +60,15 @@ type queuecontroller struct {
 	vcClient   vcclientset.Interface
 
 	// informer
-	queueInformer schedulinginformer.QueueInformer
-	pgInformer    schedulinginformer.PodGroupInformer
+	queueInformer          schedulinginformer.QueueInformer
+	namespaceQueueInformer schedulinginformer.NamespaceQueueInformer
+	pgInformer             schedulinginformer.PodGroupInformer
 
 	// queueLister
-	queueLister schedulinglister.QueueLister
-	queueSynced cache.InformerSynced
+	queueLister          schedulinglister.QueueLister
+	namespaceQueueLister schedulinglister.NamespaceQueueLister
+	queueSynced          cache.InformerSynced
+	namespaceQueueSynced cache.InformerSynced
 
 	// podGroup lister
 	pgLister schedulinglister.PodGroupLister
@@ -81,7 +85,7 @@ type queuecontroller struct {
 	commandQueue workqueue.TypedRateLimitingInterface[*busv1alpha1.Command]
 
 	pgMutex sync.RWMutex
-	// queue name -> podgroup namespace/name
+	// canonical queue key -> podgroup namespace/name
 	podGroups map[string]map[string]struct{}
 
 	syncHandler        func(req *apis.Request) error
@@ -105,6 +109,7 @@ func (c *queuecontroller) Initialize(opt *framework.ControllerOption) error {
 
 	factory := opt.VCSharedInformerFactory
 	queueInformer := factory.Scheduling().V1beta1().Queues()
+	namespaceQueueInformer := factory.Scheduling().V1beta1().NamespaceQueues()
 	pgInformer := factory.Scheduling().V1beta1().PodGroups()
 
 	eventBroadcaster := record.NewBroadcaster()
@@ -113,9 +118,12 @@ func (c *queuecontroller) Initialize(opt *framework.ControllerOption) error {
 
 	c.vcInformerFactory = factory
 	c.queueInformer = queueInformer
+	c.namespaceQueueInformer = namespaceQueueInformer
 	c.pgInformer = pgInformer
 	c.queueLister = queueInformer.Lister()
+	c.namespaceQueueLister = namespaceQueueInformer.Lister()
 	c.queueSynced = queueInformer.Informer().HasSynced
+	c.namespaceQueueSynced = namespaceQueueInformer.Informer().HasSynced
 	c.pgLister = pgInformer.Lister()
 	c.pgSynced = pgInformer.Informer().HasSynced
 	c.queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[*apis.Request]())
@@ -132,6 +140,12 @@ func (c *queuecontroller) Initialize(opt *framework.ControllerOption) error {
 		AddFunc:    c.addQueue,
 		UpdateFunc: c.updateQueue,
 		DeleteFunc: c.deleteQueue,
+	})
+
+	namespaceQueueInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addNamespaceQueue,
+		UpdateFunc: c.updateNamespaceQueue,
+		DeleteFunc: c.deleteNamespaceQueue,
 	})
 
 	pgInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -225,7 +239,28 @@ func (c *queuecontroller) handleQueue(req *apis.Request) error {
 		klog.V(4).Infof("Finished syncing queue %s (%v).", req.QueueName, time.Since(startTime))
 	}()
 
-	queue, err := c.queueLister.Get(req.QueueName)
+	if queueutil.IsNamespaceKey(req.QueueName) {
+		namespace, name, ok := queueutil.ParseNamespaceKey(req.QueueName)
+		if !ok {
+			return fmt.Errorf("invalid namespace queue key %s", req.QueueName)
+		}
+		namespaceQueue, err := c.namespaceQueueLister.NamespaceQueues(namespace).Get(name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				klog.V(4).Infof("NamespaceQueue %s has been deleted.", req.QueueName)
+				return nil
+			}
+			return fmt.Errorf("get namespace queue %s failed for %v", req.QueueName, err)
+		}
+		return c.handleNamespaceQueue(req, namespaceQueue)
+	}
+
+	clusterQueueName, ok := queueutil.ParseClusterKey(req.QueueName)
+	if !ok {
+		clusterQueueName = req.QueueName
+	}
+	queue, err := c.queueLister.Get(clusterQueueName)
+
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			klog.V(4).Infof("Queue %s has been deleted.", req.QueueName)

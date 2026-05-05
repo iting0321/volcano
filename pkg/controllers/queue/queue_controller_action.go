@@ -36,6 +36,7 @@ import (
 	v1beta1apply "volcano.sh/apis/pkg/client/applyconfiguration/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 	"volcano.sh/volcano/pkg/controllers/metrics"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	"volcano.sh/volcano/pkg/controllers/queue/state"
 )
 
@@ -55,7 +56,8 @@ func (c *queuecontroller) syncQueue(queue *schedulingv1beta1.Queue, updateStateF
 		return err
 	}
 
-	podGroups := c.getPodGroups(queue.Name)
+	queueKey := queueutil.ClusterKey(queue.Name)
+	podGroups := c.getPodGroups(queueKey)
 	queueStatus := schedulingv1beta1.QueueStatus{}
 
 	for _, pgKey := range podGroups {
@@ -70,7 +72,7 @@ func (c *queuecontroller) syncQueue(queue *schedulingv1beta1.Queue, updateStateF
 
 			klog.V(4).Infof("The podGroup %s is not found, skip it and continue to sync cache", pgKey)
 			c.pgMutex.Lock()
-			delete(c.podGroups[queue.Name], pgKey)
+				delete(c.podGroups[queueKey], pgKey)
 			c.pgMutex.Unlock()
 			continue
 		}
@@ -90,7 +92,7 @@ func (c *queuecontroller) syncQueue(queue *schedulingv1beta1.Queue, updateStateF
 	}
 
 	// Update the metrics
-	metrics.UpdateQueueMetrics(queue.Name, &queueStatus)
+	metrics.UpdateQueueMetrics(queueKey, &queueStatus)
 
 	if updateStateFn != nil {
 		updateStateFn(&queueStatus, podGroups)
@@ -152,7 +154,7 @@ func (c *queuecontroller) closeQueue(queue *schedulingv1beta1.Queue, updateState
 		}
 	}
 
-	podGroups := c.getPodGroups(queue.Name)
+	podGroups := c.getPodGroups(queueutil.ClusterKey(queue.Name))
 	newQueue := queue.DeepCopy()
 	if updateStateFn != nil {
 		updateStateFn(&newQueue.Status, podGroups)
@@ -170,6 +172,88 @@ func (c *queuecontroller) closeQueue(queue *schedulingv1beta1.Queue, updateState
 	}
 
 	return nil
+}
+
+func (c *queuecontroller) handleNamespaceQueue(req *apis.Request, queue *schedulingv1beta1.NamespaceQueue) error {
+	klog.V(4).Infof("Begin execute %s action for namespace queue %s/%s, current status %s", req.Action, queue.Namespace, queue.Name, queue.Status.State)
+	switch req.Action {
+	case busv1alpha1.OpenQueueAction:
+		return c.openNamespaceQueue(queue)
+	case busv1alpha1.CloseQueueAction:
+		return c.closeNamespaceQueue(queue)
+	default:
+		return c.syncNamespaceQueue(queue)
+	}
+}
+
+func (c *queuecontroller) syncNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	queueKey := queueutil.NamespaceKey(queue.Namespace, queue.Name)
+	podGroups := c.getPodGroups(queueKey)
+	queueStatus := schedulingv1beta1.QueueStatus{}
+
+	for _, pgKey := range podGroups {
+		ns, name, _ := cache.SplitMetaNamespaceKey(pgKey)
+		pg, err := c.pgLister.PodGroups(ns).Get(name)
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				return err
+			}
+			c.pgMutex.Lock()
+			delete(c.podGroups[queueKey], pgKey)
+			c.pgMutex.Unlock()
+			continue
+		}
+		switch pg.Status.Phase {
+		case schedulingv1beta1.PodGroupPending:
+			queueStatus.Pending++
+		case schedulingv1beta1.PodGroupRunning:
+			queueStatus.Running++
+		case schedulingv1beta1.PodGroupUnknown:
+			queueStatus.Unknown++
+		case schedulingv1beta1.PodGroupInqueue:
+			queueStatus.Inqueue++
+		case schedulingv1beta1.PodGroupCompleted:
+			queueStatus.Completed++
+		}
+	}
+
+	if queue.Status.State == schedulingv1beta1.QueueStateClosed && len(podGroups) > 0 {
+		queueStatus.State = schedulingv1beta1.QueueStateClosing
+	} else if queue.Status.State == schedulingv1beta1.QueueStateClosing && len(podGroups) == 0 {
+		queueStatus.State = schedulingv1beta1.QueueStateClosed
+	} else if queue.Status.State == "" {
+		queueStatus.State = schedulingv1beta1.QueueStateOpen
+	} else {
+		queueStatus.State = queue.Status.State
+	}
+
+	metrics.UpdateQueueMetrics(queueKey, &queueStatus)
+	if queueStatus.State == queue.Status.State {
+		return nil
+	}
+
+	newQueue := queue.DeepCopy()
+	newQueue.Status = queueStatus
+	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
+	return err
+}
+
+func (c *queuecontroller) openNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	newQueue := queue.DeepCopy()
+	newQueue.Status.State = schedulingv1beta1.QueueStateOpen
+	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
+	return err
+}
+
+func (c *queuecontroller) closeNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	newQueue := queue.DeepCopy()
+	if len(c.getPodGroups(queueutil.NamespaceKey(queue.Namespace, queue.Name))) == 0 {
+		newQueue.Status.State = schedulingv1beta1.QueueStateClosed
+	} else {
+		newQueue.Status.State = schedulingv1beta1.QueueStateClosing
+	}
+	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
+	return err
 }
 
 // sync the state between parent and child queues

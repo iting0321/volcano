@@ -42,7 +42,7 @@ const (
 	// preFilterStateKey is the key in CycleState to InterPodAffinity pre-computed data for Filtering.
 	// Using the name of the plugin will likely help us avoid collisions with other plugins.
 	capacityStateKey = PluginName
-	rootQueueID      = "root"
+	rootQueueID      = "cluster:root"
 )
 
 type capacityPlugin struct {
@@ -717,24 +717,23 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 	// init root queue: realCapability is and capability is set to ininity if capability is not set.  deserved are also set if empty.
 	// root queue is default queue and users are not aware of it. User is allowed to sumbit jobs which exceed current cluster total resources,
 	// so root queue should not restrict by current total resources. User need to restrict resource through creating queue manually
-	rootQueueAttr := cp.queueOpts[api.QueueID(cp.rootQueue)]
-	if rootQueueAttr == nil {
-		klog.Warningf("Root queue %q not found in session queues, skipping hierarchy initialization", cp.rootQueue)
-		return false
-	}
 	infinityResource := api.InfiniteResource()
 	if cp.totalResource.ScalarResources != nil {
 		for k := range cp.totalResource.ScalarResources {
 			infinityResource.SetScalar(k, math.MaxInt64)
 		}
 	}
-	if rootQueueAttr.capability.IsEmpty() {
-		rootQueueAttr.capability = infinityResource
+	for _, attr := range cp.queueOpts {
+		if len(attr.ancestors) != 0 {
+			continue
+		}
+		if attr.capability.IsEmpty() {
+			attr.capability = infinityResource.Clone()
+		}
+		attr.realCapability = attr.capability.Clone()
+		// checkHierarchicalQueue only logs warnings and never returns errors
+		cp.checkHierarchicalQueue(attr)
 	}
-	rootQueueAttr.realCapability = rootQueueAttr.capability
-	// checkHierarchicalQueue only logs warnings and never returns errors
-	// to avoid aborting the entire scheduling cycle due to configuration issues
-	cp.checkHierarchicalQueue(rootQueueAttr)
 
 	// Update share
 	for _, attr := range cp.queueOpts {
@@ -838,7 +837,7 @@ func (cp *capacityPlugin) newQueueAttr(queue *api.QueueInfo) *queueAttr {
 }
 
 func (cp *capacityPlugin) updateAncestors(queue *api.QueueInfo, ssn *framework.Session, visited map[api.QueueID]struct{}) error {
-	if queue.Name == cp.rootQueue {
+	if queue.Name == cp.rootQueue || queue.Queue.Spec.Parent == "" {
 		return nil
 	}
 
@@ -849,10 +848,7 @@ func (cp *capacityPlugin) updateAncestors(queue *api.QueueInfo, ssn *framework.S
 	visited[queue.UID] = struct{}{}
 	defer delete(visited, queue.UID)
 
-	parent := cp.rootQueue
-	if queue.Queue.Spec.Parent != "" {
-		parent = queue.Queue.Spec.Parent
-	}
+	parent := queue.Queue.Spec.Parent
 	if _, exist := ssn.Queues[api.QueueID(parent)]; !exist {
 		return fmt.Errorf("the queue %s has invalid parent queue %s", queue.Name, parent)
 	}

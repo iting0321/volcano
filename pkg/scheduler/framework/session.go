@@ -498,7 +498,6 @@ func addNodeSharableDeviceUsage(ssn *Session, task *api.TaskInfo) {
 
 // updateQueueStatus updates allocated field in queue status on session close.
 func updateQueueStatus(ssn *Session) {
-	rootQueue := api.QueueID("root")
 	// calculate allocated resources on each queue
 	var allocatedResources = make(map[api.QueueID]*api.Resource, len(ssn.Queues))
 	for queueID := range ssn.Queues {
@@ -512,18 +511,14 @@ func updateQueueStatus(ssn *Session) {
 					allocatedResources[job.Queue].Add(task.Resreq)
 					// recursively updates the allocated resources of parent queues
 					queue := ssn.Queues[job.Queue].Queue
-					// compatibility unit testing
-					for ssn.Queues[rootQueue] != nil {
-						parent := string(rootQueue)
-						if queue.Spec.Parent != "" {
-							parent = queue.Spec.Parent
-						}
-						allocatedResources[api.QueueID(parent)].Add(task.Resreq)
-
-						if parent == string(rootQueue) {
+					for queue.Spec.Parent != "" {
+						parentID := api.QueueID(queue.Spec.Parent)
+						parentQueue, found := ssn.Queues[parentID]
+						if !found {
 							break
 						}
-						queue = ssn.Queues[api.QueueID(queue.Spec.Parent)].Queue
+						allocatedResources[parentID].Add(task.Resreq)
+						queue = parentQueue.Queue
 					}
 				}
 			}

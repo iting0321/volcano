@@ -41,6 +41,7 @@ import (
 	jobhelpers "volcano.sh/volcano/pkg/controllers/job/helpers"
 	"volcano.sh/volcano/pkg/controllers/job/plugins"
 	controllerMpi "volcano.sh/volcano/pkg/controllers/job/plugins/distributed-framework/mpi"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	"volcano.sh/volcano/pkg/webhooks/router"
 	"volcano.sh/volcano/pkg/webhooks/schema"
 	"volcano.sh/volcano/pkg/webhooks/util"
@@ -198,31 +199,47 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionR
 		msg += err.Error()
 	}
 
-	queue, err := config.QueueLister.Get(job.Spec.Queue)
+	queueRef, err := queueutil.Resolve(job.Namespace, job.Spec.Queue, config.QueueLister, config.NamespaceQueueLister)
 	if err != nil {
 		msg += fmt.Sprintf(" unable to find job queue: %v;", err)
 	} else {
-		if queue.Status.State != schedulingv1beta1.QueueStateOpen {
-			msg += fmt.Sprintf(" can only submit job to queue with state `Open`, "+
-				"queue `%s` status is `%s`;", queue.Name, queue.Status.State)
-		}
-
-		// validate hierarchical queue
-		if queue.Name == "root" {
-			msg += " can not submit job to root queue;"
-		} else {
-			queueList, err := config.QueueLister.List(labels.Everything())
-			if err != nil {
-				msg += fmt.Sprintf("failed to get list queues: %v;", err)
+		if queueRef.NamespaceQueue != nil {
+			if queueRef.NamespaceQueue.Status.State != schedulingv1beta1.QueueStateOpen {
+				msg += fmt.Sprintf(" can only submit job to queue with state `Open`, "+
+					"queue `%s/%s` status is `%s`;", queueRef.Namespace, queueRef.Name, queueRef.NamespaceQueue.Status.State)
 			}
-			childQueues := make([]*schedulingv1beta1.Queue, 0)
-			for _, childQueue := range queueList {
-				if childQueue.Spec.Parent == queue.Name {
-					childQueues = append(childQueues, childQueue)
-				}
+			childQueues, err := config.GetNamespaceQueuesByParent(queueRef.Namespace, queueRef.Name)
+			if err != nil {
+				msg += fmt.Sprintf("failed to get list namespace queues: %v;", err)
 			}
 			if len(childQueues) > 0 {
-				msg += fmt.Sprintf(" can only submit job to leaf queue, "+"queue `%s` has %d child queues;", queue.Name, len(childQueues))
+				msg += fmt.Sprintf(" can only submit job to leaf queue, queue `%s/%s` has %d child queues;",
+					queueRef.Namespace, queueRef.Name, len(childQueues))
+			}
+		} else {
+			queue := queueRef.Queue
+			if queue.Status.State != schedulingv1beta1.QueueStateOpen {
+				msg += fmt.Sprintf(" can only submit job to queue with state `Open`, "+
+					"queue `%s` status is `%s`;", queue.Name, queue.Status.State)
+			}
+
+			// validate hierarchical queue
+			if queue.Name == "root" {
+				msg += " can not submit job to root queue;"
+			} else {
+				queueList, err := config.QueueLister.List(labels.Everything())
+				if err != nil {
+					msg += fmt.Sprintf("failed to get list queues: %v;", err)
+				}
+				childQueues := make([]*schedulingv1beta1.Queue, 0)
+				for _, childQueue := range queueList {
+					if childQueue.Spec.Parent == queue.Name {
+						childQueues = append(childQueues, childQueue)
+					}
+				}
+				if len(childQueues) > 0 {
+					msg += fmt.Sprintf(" can only submit job to leaf queue, "+"queue `%s` has %d child queues;", queue.Name, len(childQueues))
+				}
 			}
 		}
 	}

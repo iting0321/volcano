@@ -49,7 +49,7 @@ var service = &router.AdmissionService{
 					Rule: whv1.Rule{
 						APIGroups:   []string{schedulingv1beta1.SchemeGroupVersion.Group},
 						APIVersions: []string{schedulingv1beta1.SchemeGroupVersion.Version},
-						Resources:   []string{"queues"},
+						Resources:   []string{"queues", "namespacequeues"},
 					},
 				},
 			},
@@ -66,6 +66,10 @@ type patchOperation struct {
 // Queues mutate queues.
 func Queues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	klog.V(3).Infof("Mutating %s queue %s.", ar.Request.Operation, ar.Request.Name)
+
+	if ar.Request.Resource.Resource == "namespacequeues" {
+		return mutateNamespaceQueues(ar)
+	}
 
 	queue, err := schema.DecodeQueue(ar.Request.Object, ar.Request.Resource)
 	if err != nil {
@@ -140,4 +144,44 @@ func createQueuePatch(queue *schedulingv1beta1.Queue) ([]byte, error) {
 	}
 
 	return json.Marshal(patch)
+}
+
+func mutateNamespaceQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	queue, err := schema.DecodeNamespaceQueue(ar.Request.Object, ar.Request.Resource)
+	if err != nil {
+		return util.ToAdmissionResponse(err)
+	}
+
+	var patch []patchOperation
+	trueValue := true
+	if queue.Spec.Reclaimable == nil {
+		patch = append(patch, patchOperation{
+			Op:    "add",
+			Path:  "/spec/reclaimable",
+			Value: &trueValue,
+		})
+	}
+	defaultWeight := 1
+	if queue.Spec.Weight == 0 {
+		patch = append(patch, patchOperation{
+			Op:    "add",
+			Path:  "/spec/weight",
+			Value: &defaultWeight,
+		})
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result:  &metav1.Status{Message: err.Error()},
+		}
+	}
+
+	reviewResponse := admissionv1.AdmissionResponse{Allowed: true, Patch: patchBytes}
+	if len(patchBytes) > 0 {
+		pt := admissionv1.PatchTypeJSONPatch
+		reviewResponse.PatchType = &pt
+	}
+	return &reviewResponse
 }

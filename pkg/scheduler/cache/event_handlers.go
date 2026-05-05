@@ -55,6 +55,7 @@ import (
 	nodeshardv1alpha1 "volcano.sh/apis/pkg/apis/shard/v1alpha1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/apis/pkg/apis/utils"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
 	schedulercache "volcano.sh/volcano/pkg/schedulercommon/cache"
@@ -799,7 +800,11 @@ func (sc *SchedulerCache) setPodGroup(ss *schedulingapi.PodGroup) error {
 
 	// TODO(k82cn): set default queue in admission.
 	if len(ss.Spec.Queue) == 0 {
-		sc.Jobs[job].Queue = schedulingapi.QueueID(sc.defaultQueue)
+		sc.Jobs[job].Queue = schedulingapi.QueueID(queueutil.ClusterKey(sc.defaultQueue))
+	} else if _, found := sc.Queues[schedulingapi.QueueID(queueutil.NamespaceKey(ss.Namespace, ss.Spec.Queue))]; found {
+		sc.Jobs[job].Queue = schedulingapi.QueueID(queueutil.NamespaceKey(ss.Namespace, ss.Spec.Queue))
+	} else {
+		sc.Jobs[job].Queue = schedulingapi.QueueID(queueutil.ClusterKey(ss.Spec.Queue))
 	}
 
 	metrics.UpdateE2eSchedulingStartTimeByJob(sc.Jobs[job].Name, string(sc.Jobs[job].Queue), sc.Jobs[job].Namespace,
@@ -941,6 +946,21 @@ func (sc *SchedulerCache) AddQueueV1beta1(obj interface{}) {
 	sc.addQueue(queue)
 }
 
+// AddNamespaceQueueV1beta1 add namespace queue to scheduler cache
+func (sc *SchedulerCache) AddNamespaceQueueV1beta1(obj interface{}) {
+	ss, ok := obj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		klog.Errorf("Cannot convert to *schedulingv1beta1.NamespaceQueue: %v", obj)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	klog.V(4).Infof("Add NamespaceQueue(%s/%s) into cache, spec(%#v)", ss.Namespace, ss.Name, ss.Spec)
+	sc.addNamespaceQueue(ss)
+}
+
 // UpdateQueueV1beta1 update queue to scheduler cache
 func (sc *SchedulerCache) UpdateQueueV1beta1(oldObj, newObj interface{}) {
 	oldSS, ok := oldObj.(*schedulingv1beta1.Queue)
@@ -969,6 +989,27 @@ func (sc *SchedulerCache) UpdateQueueV1beta1(oldObj, newObj interface{}) {
 	sc.updateQueue(newQueue)
 }
 
+// UpdateNamespaceQueueV1beta1 updates namespace queue in scheduler cache.
+func (sc *SchedulerCache) UpdateNamespaceQueueV1beta1(oldObj, newObj interface{}) {
+	oldSS, ok := oldObj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		klog.Errorf("Cannot convert oldObj to *schedulingv1beta1.NamespaceQueue: %v", oldObj)
+		return
+	}
+	newSS, ok := newObj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		klog.Errorf("Cannot convert newObj to *schedulingv1beta1.NamespaceQueue: %v", newObj)
+		return
+	}
+	if oldSS.ResourceVersion == newSS.ResourceVersion {
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+	sc.addNamespaceQueue(newSS)
+}
+
 // DeleteQueueV1beta1 delete queue from the scheduler cache
 func (sc *SchedulerCache) DeleteQueueV1beta1(obj interface{}) {
 	var ss *schedulingv1beta1.Queue
@@ -989,11 +1030,39 @@ func (sc *SchedulerCache) DeleteQueueV1beta1(obj interface{}) {
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
-	sc.deleteQueue(schedulingapi.QueueID(ss.Name))
+	sc.deleteQueue(schedulingapi.QueueID(queueutil.ClusterKey(ss.Name)))
+}
+
+// DeleteNamespaceQueueV1beta1 delete namespace queue from scheduler cache.
+func (sc *SchedulerCache) DeleteNamespaceQueueV1beta1(obj interface{}) {
+	var ss *schedulingv1beta1.NamespaceQueue
+	switch t := obj.(type) {
+	case *schedulingv1beta1.NamespaceQueue:
+		ss = t
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		ss, ok = t.Obj.(*schedulingv1beta1.NamespaceQueue)
+		if !ok {
+			klog.Errorf("Cannot convert to *schedulingv1beta1.NamespaceQueue: %v", t.Obj)
+			return
+		}
+	default:
+		klog.Errorf("Cannot convert to *schedulingv1beta1.NamespaceQueue: %v", obj)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+	sc.deleteQueue(schedulingapi.QueueID(queueutil.NamespaceKey(ss.Namespace, ss.Name)))
 }
 
 func (sc *SchedulerCache) addQueue(queue *scheduling.Queue) {
 	qi := schedulingapi.NewQueueInfo(queue)
+	sc.Queues[qi.UID] = qi
+}
+
+func (sc *SchedulerCache) addNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) {
+	qi := schedulingapi.NewNamespaceQueueInfo(queue)
 	sc.Queues[qi.UID] = qi
 }
 

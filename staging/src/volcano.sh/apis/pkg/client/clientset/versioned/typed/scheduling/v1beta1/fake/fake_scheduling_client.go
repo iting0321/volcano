@@ -31,6 +31,10 @@ func (c *FakeSchedulingV1beta1) PodGroups(namespace string) v1beta1.PodGroupInte
 	return newFakePodGroups(c, namespace)
 }
 
+func (c *FakeSchedulingV1beta1) NamespaceQueues(namespace string) v1beta1.NamespaceQueueInterface {
+	return newFakeNamespaceQueues(c, namespace)
+}
+
 func (c *FakeSchedulingV1beta1) Queues() v1beta1.QueueInterface {
 	return newFakeQueues(c)
 }

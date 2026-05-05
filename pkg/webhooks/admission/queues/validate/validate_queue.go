@@ -59,7 +59,7 @@ var service = &router.AdmissionService{
 					Rule: whv1.Rule{
 						APIGroups:   []string{schedulingv1beta1.SchemeGroupVersion.Group},
 						APIVersions: []string{schedulingv1beta1.SchemeGroupVersion.Version},
-						Resources:   []string{"queues"},
+						Resources:   []string{"queues", "namespacequeues"},
 					},
 				},
 			},
@@ -72,6 +72,10 @@ var config = &router.AdmissionServiceConfig{}
 // AdmitQueues is to admit queues and return response.
 func AdmitQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	klog.V(3).Infof("Admitting %s queue %s.", ar.Request.Operation, ar.Request.Name)
+
+	if ar.Request.Resource.Resource == "namespacequeues" {
+		return admitNamespaceQueues(ar)
+	}
 
 	queue, err := schema.DecodeQueue(ar.Request.Object, ar.Request.Resource)
 	if err != nil {
@@ -681,5 +685,92 @@ func validateChildrenConstraints(parent *schedulingv1beta1.Queue, children []*sc
 		}
 	}
 
+	return nil
+}
+
+func admitNamespaceQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	namespaceQueue, err := schema.DecodeNamespaceQueue(ar.Request.Object, ar.Request.Resource)
+	if err != nil {
+		return util.ToAdmissionResponse(err)
+	}
+
+	switch ar.Request.Operation {
+	case admissionv1.Create, admissionv1.Update:
+		if err := validateNamespaceQueue(namespaceQueue); err != nil {
+			return util.ToAdmissionResponse(err)
+		}
+		if ar.Request.Operation == admissionv1.Update {
+			oldNamespaceQueue, err := schema.DecodeNamespaceQueue(ar.Request.OldObject, ar.Request.Resource)
+			if err != nil {
+				return util.ToAdmissionResponse(err)
+			}
+			if oldNamespaceQueue.Spec.Parent != namespaceQueue.Spec.Parent {
+				if err := validateNamespaceQueueParent(namespaceQueue); err != nil {
+					return util.ToAdmissionResponse(err)
+				}
+			}
+		} else if err := validateNamespaceQueueParent(namespaceQueue); err != nil {
+			return util.ToAdmissionResponse(err)
+		}
+	case admissionv1.Delete:
+		if err := validateNamespaceQueueDeleting(ar.Request.Namespace, ar.Request.Name); err != nil {
+			return util.ToAdmissionResponse(err)
+		}
+	default:
+		return util.ToAdmissionResponse(fmt.Errorf("invalid operation `%s`, expect operation to be `CREATE`, `UPDATE` or `DELETE`", ar.Request.Operation))
+	}
+
+	return &admissionv1.AdmissionResponse{Allowed: true}
+}
+
+func validateNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	errs := field.ErrorList{}
+	resourcePath := field.NewPath("requestBody")
+	errs = append(errs, validateResourceQuantityOfQueue(queue.Spec, resourcePath.Child("spec"))...)
+	errs = append(errs, validateStateOfQueue(queue.Status.State, resourcePath.Child("spec").Child("state"))...)
+	if queue.Name == "root" {
+		errs = append(errs, field.Invalid(resourcePath.Child("metadata").Child("name"), queue.Name, "namespace queue name `root` is reserved"))
+	}
+	if queue.Spec.Parent == queue.Name {
+		errs = append(errs, field.Invalid(resourcePath.Child("spec").Child("parent"), queue.Spec.Parent, "namespace queue cannot use itself as parent"))
+	}
+	if len(errs) > 0 {
+		return errs.ToAggregate()
+	}
+	return nil
+}
+
+func validateNamespaceQueueParent(queue *schedulingv1beta1.NamespaceQueue) error {
+	if queue.Spec.Parent == "" {
+		return nil
+	}
+	if config.NamespaceQueueLister == nil {
+		return fmt.Errorf("namespace queue lister is not initialized")
+	}
+	_, err := config.NamespaceQueueLister.NamespaceQueues(queue.Namespace).Get(queue.Spec.Parent)
+	if err != nil {
+		return fmt.Errorf("failed to get parent namespace queue of queue %s/%s: %v", queue.Namespace, queue.Name, err)
+	}
+	return nil
+}
+
+func validateNamespaceQueueDeleting(namespace, name string) error {
+	if config.NamespaceQueueLister == nil {
+		return nil
+	}
+	queue, err := config.NamespaceQueueLister.NamespaceQueues(namespace).Get(name)
+	if err != nil {
+		return err
+	}
+	if queue.Status.State != schedulingv1beta1.QueueStateClosed {
+		return fmt.Errorf("only queue with state `Closed` can be deleted")
+	}
+	children, err := config.GetNamespaceQueuesByParent(namespace, name)
+	if err != nil {
+		return err
+	}
+	if len(children) > 0 {
+		return fmt.Errorf("namespace queue %s/%s still has %d child queues", namespace, name, len(children))
+	}
 	return nil
 }

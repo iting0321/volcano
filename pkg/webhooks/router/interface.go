@@ -35,6 +35,8 @@ type AdmissionServiceConfig struct {
 	SchedulerNames                []string
 	KubeClient                    kubernetes.Interface
 	VolcanoClient                 versioned.Interface
+	NamespaceQueueLister          schedulinglister.NamespaceQueueLister
+	NamespaceQueueInformer        cache.SharedIndexInformer
 	QueueLister                   schedulinglister.QueueLister
 	QueueInformer                 cache.SharedIndexInformer
 	Recorder                      record.EventRecorder

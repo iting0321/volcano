@@ -32,6 +32,7 @@ import (
 	"volcano.sh/volcano/pkg/controllers/apis"
 	"volcano.sh/volcano/pkg/controllers/framework"
 	"volcano.sh/volcano/pkg/controllers/queue/state"
+	queueutil "volcano.sh/volcano/pkg/queue"
 )
 
 func newFakeController() *queuecontroller {
@@ -105,11 +106,12 @@ func TestDeleteQueue(t *testing.T) {
 
 	for i, testcase := range testCases {
 		c := newFakeController()
-		c.podGroups[testcase.queue.Name] = make(map[string]struct{})
+		queueKey := queueutil.ClusterKey(testcase.queue.Name)
+		c.podGroups[queueKey] = make(map[string]struct{})
 
 		c.deleteQueue(testcase.queue)
 
-		if _, ok := c.podGroups[testcase.queue.Name]; ok != testcase.ExpectValue {
+		if _, ok := c.podGroups[queueKey]; ok != testcase.ExpectValue {
 			t.Errorf("case %d (%s): expected: %v, got %v ", i, testcase.Name, testcase.ExpectValue, ok)
 		}
 	}
@@ -141,14 +143,15 @@ func TestAddPodGroup(t *testing.T) {
 
 	for i, testcase := range testCases {
 		c := newFakeController()
+		queueKey := queueutil.ClusterKey(testcase.podGroup.Spec.Queue)
 
 		c.addPodGroup(testcase.podGroup)
 
 		if testcase.ExpectValue != c.queue.Len() {
 			t.Errorf("case %d (%s): expected: %v, got %v ", i, testcase.Name, testcase.ExpectValue, c.queue.Len())
 		}
-		if testcase.ExpectValue != len(c.podGroups[testcase.podGroup.Spec.Queue]) {
-			t.Errorf("case %d (%s): expected: %v, got %v ", i, testcase.Name, testcase.ExpectValue, len(c.podGroups[testcase.podGroup.Spec.Queue]))
+		if testcase.ExpectValue != len(c.podGroups[queueKey]) {
+			t.Errorf("case %d (%s): expected: %v, got %v ", i, testcase.Name, testcase.ExpectValue, len(c.podGroups[queueKey]))
 		}
 	}
 
@@ -179,13 +182,14 @@ func TestDeletePodGroup(t *testing.T) {
 
 	for i, testcase := range testCases {
 		c := newFakeController()
+		queueKey := queueutil.ClusterKey(testcase.podGroup.Spec.Queue)
 
 		key, _ := cache.MetaNamespaceKeyFunc(testcase.podGroup)
-		c.podGroups[testcase.podGroup.Spec.Queue] = make(map[string]struct{})
-		c.podGroups[testcase.podGroup.Spec.Queue][key] = struct{}{}
+		c.podGroups[queueKey] = make(map[string]struct{})
+		c.podGroups[queueKey][key] = struct{}{}
 
 		c.deletePodGroup(testcase.podGroup)
-		if _, ok := c.podGroups[testcase.podGroup.Spec.Queue][key]; ok != testcase.ExpectValue {
+		if _, ok := c.podGroups[queueKey][key]; ok != testcase.ExpectValue {
 			t.Errorf("case %d (%s): expected: %v, got %v ", i, testcase.Name, testcase.ExpectValue, ok)
 		}
 	}
