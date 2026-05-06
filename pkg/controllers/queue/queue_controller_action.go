@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -189,7 +190,12 @@ func (c *queuecontroller) handleNamespaceQueue(req *apis.Request, queue *schedul
 func (c *queuecontroller) syncNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
 	queueKey := queueutil.NamespaceKey(queue.Namespace, queue.Name)
 	podGroups := c.getPodGroups(queueKey)
-	queueStatus := schedulingv1beta1.QueueStatus{}
+	queueStatus := queue.Status.DeepCopy()
+	queueStatus.Pending = 0
+	queueStatus.Running = 0
+	queueStatus.Unknown = 0
+	queueStatus.Inqueue = 0
+	queueStatus.Completed = 0
 
 	for _, pgKey := range podGroups {
 		ns, name, _ := cache.SplitMetaNamespaceKey(pgKey)
@@ -227,13 +233,13 @@ func (c *queuecontroller) syncNamespaceQueue(queue *schedulingv1beta1.NamespaceQ
 		queueStatus.State = queue.Status.State
 	}
 
-	metrics.UpdateQueueMetrics(queueKey, &queueStatus)
-	if queueStatus.State == queue.Status.State {
+	metrics.UpdateQueueMetrics(queueKey, queueStatus)
+	if equality.Semantic.DeepEqual(queue.Status, *queueStatus) {
 		return nil
 	}
 
 	newQueue := queue.DeepCopy()
-	newQueue.Status = queueStatus
+	newQueue.Status = *queueStatus
 	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
 	return err
 }
