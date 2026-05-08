@@ -125,23 +125,7 @@ func createQueuePatch(queue *schedulingv1beta1.Queue) ([]byte, error) {
 		})
 	}
 
-	trueValue := true
-	if queue.Spec.Reclaimable == nil {
-		patch = append(patch, patchOperation{
-			Op:    "add",
-			Path:  "/spec/reclaimable",
-			Value: &trueValue,
-		})
-	}
-
-	defaultWeight := 1
-	if queue.Spec.Weight == 0 {
-		patch = append(patch, patchOperation{
-			Op:    "add",
-			Path:  "/spec/weight",
-			Value: &defaultWeight,
-		})
-	}
+	patch = appendQueueDefaultPatches(patch, queue.Spec.Reclaimable, queue.Spec.Weight)
 
 	return json.Marshal(patch)
 }
@@ -152,23 +136,7 @@ func mutateNamespaceQueues(ar admissionv1.AdmissionReview) *admissionv1.Admissio
 		return util.ToAdmissionResponse(err)
 	}
 
-	var patch []patchOperation
-	trueValue := true
-	if queue.Spec.Reclaimable == nil {
-		patch = append(patch, patchOperation{
-			Op:    "add",
-			Path:  "/spec/reclaimable",
-			Value: &trueValue,
-		})
-	}
-	defaultWeight := 1
-	if queue.Spec.Weight == 0 {
-		patch = append(patch, patchOperation{
-			Op:    "add",
-			Path:  "/spec/weight",
-			Value: &defaultWeight,
-		})
-	}
+	patch := appendQueueDefaultPatches(nil, queue.Spec.Reclaimable, queue.Spec.Weight)
 
 	patchBytes, err := json.Marshal(patch)
 	if err != nil {
@@ -184,4 +152,26 @@ func mutateNamespaceQueues(ar admissionv1.AdmissionReview) *admissionv1.Admissio
 		reviewResponse.PatchType = &pt
 	}
 	return &reviewResponse
+}
+
+func appendQueueDefaultPatches(patch []patchOperation, reclaimable *bool, weight int32) []patchOperation {
+	trueValue := true
+	if reclaimable == nil {
+		patch = append(patch, patchOperation{
+			Op:    "add",
+			Path:  "/spec/reclaimable",
+			Value: &trueValue,
+		})
+	}
+
+	defaultWeight := 1
+	if weight == 0 {
+		patch = append(patch, patchOperation{
+			Op:    "add",
+			Path:  "/spec/weight",
+			Value: &defaultWeight,
+		})
+	}
+
+	return patch
 }
