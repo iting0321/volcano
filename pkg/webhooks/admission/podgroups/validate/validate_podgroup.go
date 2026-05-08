@@ -18,6 +18,7 @@ package validate
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -126,6 +127,26 @@ func validateNetworkTopology(networkTopology *schedulingv1beta1.NetworkTopologyS
 		if policy.NetworkTopology != nil && policy.NetworkTopology.HighestTierAllowed != nil && policy.NetworkTopology.HighestTierName != "" {
 			errs = append(errs, fmt.Sprintf("in subGroupPolicy '%s': must not specify 'highestTierAllowed' and 'highestTierName' in networkTopology simultaneously.", policy.Name))
 			break
+		}
+		if len(policy.ExpectedSubGroups) > 0 {
+			if policy.MinSubGroups == nil || policy.ExpectedSubGroups[0] != *policy.MinSubGroups {
+				errs = append(errs, fmt.Sprintf("in subGroupPolicy '%s': ExpectedSubGroups[0] must equal MinSubGroups.", policy.Name))
+				break
+			}
+			for i, count := range policy.ExpectedSubGroups {
+				if count <= 0 {
+					errs = append(errs, fmt.Sprintf("in subGroupPolicy '%s': ExpectedSubGroups must contain only positive values.", policy.Name))
+					break
+				}
+				if i > 0 && count <= policy.ExpectedSubGroups[i-1] {
+					errs = append(errs, fmt.Sprintf("in subGroupPolicy '%s': ExpectedSubGroups must be strictly increasing.", policy.Name))
+					break
+				}
+			}
+			if !slices.Contains(policy.ExpectedSubGroups, *policy.MinSubGroups) {
+				errs = append(errs, fmt.Sprintf("in subGroupPolicy '%s': ExpectedSubGroups must include MinSubGroups.", policy.Name))
+				break
+			}
 		}
 	}
 	return strings.Join(errs, " ")

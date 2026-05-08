@@ -360,6 +360,7 @@ type JobInfo struct {
 	SubJobs            map[SubJobID]*SubJobInfo
 	TaskToSubJob       map[TaskID]SubJobID
 	MinSubJobs         map[SubJobGID]int32 // key is name of "PodGroup.Spec.SubGroupPolicy", value is minSubGroups
+	ExpectedSubJobs    map[SubJobGID][]int32
 
 	// All tasks of the Job.
 	TaskStatusIndex       map[TaskStatus]TasksMap
@@ -411,6 +412,8 @@ func NewJobInfo(uid JobID, tasks ...*TaskInfo) *JobInfo {
 // UnsetPodGroup removes podGroup details from a job
 func (ji *JobInfo) UnsetPodGroup() {
 	ji.PodGroup = nil
+	clear(ji.MinSubJobs)
+	clear(ji.ExpectedSubJobs)
 
 	clear(ji.SubJobs)
 	for _, task := range ji.Tasks {
@@ -458,12 +461,19 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 			ji.addTaskToSubJob(task)
 		}
 		clear(ji.MinSubJobs)
+		clear(ji.ExpectedSubJobs)
 		for _, policy := range pg.Spec.SubGroupPolicy {
 			groupID := getSubJobGID(ji.UID, policy.Name)
 			if policy.MinSubGroups == nil {
 				ji.MinSubJobs[groupID] = 0
 			} else {
 				ji.MinSubJobs[groupID] = *policy.MinSubGroups
+			}
+			if len(policy.ExpectedSubGroups) > 0 {
+				if ji.ExpectedSubJobs == nil {
+					ji.ExpectedSubJobs = map[SubJobGID][]int32{}
+				}
+				ji.ExpectedSubJobs[groupID] = append([]int32(nil), policy.ExpectedSubGroups...)
 			}
 		}
 	}
@@ -715,6 +725,7 @@ func (ji *JobInfo) Clone() *JobInfo {
 		SubJobs:               map[SubJobID]*SubJobInfo{},
 		TaskToSubJob:          map[TaskID]SubJobID{},
 		MinSubJobs:            maps.Clone(ji.MinSubJobs),
+		ExpectedSubJobs:       cloneExpectedSubJobs(ji.ExpectedSubJobs),
 	}
 
 	ji.CreationTimestamp.DeepCopyInto(&info.CreationTimestamp)
@@ -1121,6 +1132,11 @@ func (ji *JobInfo) CheckSubJobValid() bool {
 			return false
 		}
 	}
+	for subJobGID, expectedCounts := range ji.ExpectedSubJobs {
+		if len(expectedCounts) > 0 && subJobs[subJobGID] < expectedCounts[len(expectedCounts)-1] {
+			return false
+		}
+	}
 	return true
 }
 
@@ -1135,15 +1151,58 @@ func (ji *JobInfo) checkSubJobCondition(condition subJobCondition) error {
 		}
 	}
 	for subJobGID, minSubJobs := range ji.MinSubJobs {
-		if minSubJobs == 0 {
+		target := minSubJobs
+		if expectedTarget, ok := ji.subJobTargetCount(subJobGID, allocatedSubJobs[subJobGID]); ok {
+			target = expectedTarget
+		}
+		if target == 0 {
 			continue
 		}
-		if allocatedSubJobs[subJobGID] < minSubJobs {
-			return fmt.Errorf("the number of allocated subGroups %d is less than the number of subGroups %d with the minSubGroups attribute in subGroupPolicy %s.",
-				allocatedSubJobs[subJobGID], minSubJobs, subJobGID)
+		if allocatedSubJobs[subJobGID] < target {
+			return fmt.Errorf("the number of allocated subGroups %d is less than the target number of subGroups %d in subGroupPolicy %s.",
+				allocatedSubJobs[subJobGID], target, subJobGID)
 		}
 	}
 	return nil
+}
+
+func cloneExpectedSubJobs(in map[SubJobGID][]int32) map[SubJobGID][]int32 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[SubJobGID][]int32, len(in))
+	for gid, counts := range in {
+		out[gid] = append([]int32(nil), counts...)
+	}
+	return out
+}
+
+func (ji *JobInfo) subJobTargetCount(gid SubJobGID, current int32) (int32, bool) {
+	expected := ji.ExpectedSubJobs[gid]
+	if len(expected) == 0 {
+		return 0, false
+	}
+
+	for _, count := range expected {
+		if current < count {
+			return count, true
+		}
+	}
+
+	return current, true
+}
+
+func (ji *JobInfo) SubJobTargetCounts(readyCounts map[SubJobGID]int32) map[SubJobGID]int32 {
+	targets := make(map[SubJobGID]int32, len(ji.MinSubJobs))
+	for gid, minSubJobs := range ji.MinSubJobs {
+		targets[gid] = minSubJobs
+		if expectedTarget, ok := ji.subJobTargetCount(gid, readyCounts[gid]); ok {
+			if expectedTarget > targets[gid] {
+				targets[gid] = expectedTarget
+			}
+		}
+	}
+	return targets
 }
 
 func (ji *JobInfo) CheckSubJobReady() bool {

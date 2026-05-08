@@ -18,6 +18,7 @@ package validate
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
@@ -320,10 +321,40 @@ func validatePartitionPolicy(task v1alpha1.TaskSpec, job *v1alpha1.Job) string {
 		} else if task.MinAvailable != nil && task.PartitionPolicy.MinPartitions*task.PartitionPolicy.PartitionSize != *task.MinAvailable {
 			msg += fmt.Sprintf("'MinAvailable' is not equal to MinPartitions*PartitionSize in task: %s, job: %s", task.Name, job.Name)
 		}
+		msg += validateExpectedPartitions(task, job)
 		msg += validateNetworkTopology(task.PartitionPolicy.NetworkTopology)
 	}
 
 	return msg
+}
+
+func validateExpectedPartitions(task v1alpha1.TaskSpec, job *v1alpha1.Job) string {
+	expected := task.PartitionPolicy.ExpectedPartitions
+	if len(expected) == 0 {
+		return ""
+	}
+
+	if expected[0] != task.PartitionPolicy.MinPartitions {
+		return fmt.Sprintf("'ExpectedPartitions[0]' must equal MinPartitions in task: %s, job: %s", task.Name, job.Name)
+	}
+
+	for i, count := range expected {
+		if count <= 0 {
+			return fmt.Sprintf("'ExpectedPartitions' must contain only positive values in task: %s, job: %s", task.Name, job.Name)
+		}
+		if count > task.PartitionPolicy.TotalPartitions {
+			return fmt.Sprintf("'ExpectedPartitions' must not exceed TotalPartitions in task: %s, job: %s", task.Name, job.Name)
+		}
+		if i > 0 && count <= expected[i-1] {
+			return fmt.Sprintf("'ExpectedPartitions' must be strictly increasing in task: %s, job: %s", task.Name, job.Name)
+		}
+	}
+
+	if !slices.Contains(expected, task.PartitionPolicy.TotalPartitions) {
+		return fmt.Sprintf("'ExpectedPartitions' must include TotalPartitions in task: %s, job: %s", task.Name, job.Name)
+	}
+
+	return ""
 }
 
 func validateNetworkTopology(networkTopology *v1alpha1.NetworkTopologySpec) string {

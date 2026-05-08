@@ -219,6 +219,7 @@ func (alloc *Action) organizeJobWorksheet(job *api.JobInfo) *JobWorksheet {
 			subJobs = append(subJobs, subJob)
 		}
 	}
+	targetSubJobCounts := job.SubJobTargetCounts(subJobCountMap)
 	slices.SortFunc(subJobs, func(l, r *api.SubJobInfo) int {
 		if !ssn.SubJobOrderFn(l, r) {
 			return 1
@@ -228,7 +229,7 @@ func (alloc *Action) organizeJobWorksheet(job *api.JobInfo) *JobWorksheet {
 	// Find the smallest set of subJobs that meets the requirements for job execution.
 	requireSubJobs := sets.Set[api.SubJobID]{}
 	for _, subJob := range subJobs {
-		if subJobCountMap[subJob.GID] < job.MinSubJobs[subJob.GID] {
+		if subJobCountMap[subJob.GID] < targetSubJobCounts[subJob.GID] {
 			requireSubJobs.Insert(subJob.UID)
 			subJobCountMap[subJob.GID]++
 		}

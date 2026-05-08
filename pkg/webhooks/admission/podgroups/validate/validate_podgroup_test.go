@@ -24,6 +24,7 @@ import (
 	admissionv1 "k8s.io/api/admission/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	fakeclient "volcano.sh/apis/pkg/client/clientset/versioned/fake"
@@ -187,6 +188,52 @@ func TestValidatePodGroup(t *testing.T) {
 			},
 			queue:       &schedulingv1beta1.Queue{},
 			expectError: true,
+		},
+		{
+			name: "invalid podgroup configured with unsorted ExpectedSubGroups",
+			podGroup: &schedulingv1beta1.PodGroup{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "PodGroup",
+					APIVersion: "scheduling.volcano.sh/v1beta1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-podgroup",
+				},
+				Spec: schedulingv1beta1.PodGroupSpec{
+					SubGroupPolicy: []schedulingv1beta1.SubGroupPolicySpec{
+						{
+							Name:              "test-policy",
+							MinSubGroups:      ptr.To(int32(1)),
+							ExpectedSubGroups: []int32{1, 3, 2},
+						},
+					},
+				},
+			},
+			queue:       &schedulingv1beta1.Queue{},
+			expectError: true,
+		},
+		{
+			name: "valid podgroup configured with ExpectedSubGroups",
+			podGroup: &schedulingv1beta1.PodGroup{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "PodGroup",
+					APIVersion: "scheduling.volcano.sh/v1beta1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-podgroup",
+				},
+				Spec: schedulingv1beta1.PodGroupSpec{
+					SubGroupPolicy: []schedulingv1beta1.SubGroupPolicySpec{
+						{
+							Name:              "test-policy",
+							MinSubGroups:      ptr.To(int32(1)),
+							ExpectedSubGroups: []int32{1, 2, 4},
+						},
+					},
+				},
+			},
+			queue:       &schedulingv1beta1.Queue{},
+			expectError: false,
 		},
 		{
 			name: "invalid podgroup configured with NetworkTopology containing HighestTierAllowed and HighestTierName",

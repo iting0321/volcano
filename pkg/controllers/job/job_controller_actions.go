@@ -1105,9 +1105,10 @@ func updatePgSubGroupPolicy(pg *scheduling.PodGroup, tasks []batch.TaskSpec) boo
 
 func getSubGroupPolicy(taskSpec batch.TaskSpec) scheduling.SubGroupPolicySpec {
 	subGroupPolicy := scheduling.SubGroupPolicySpec{
-		Name:         taskSpec.Name,
-		SubGroupSize: &taskSpec.PartitionPolicy.PartitionSize,
-		MinSubGroups: &taskSpec.PartitionPolicy.MinPartitions,
+		Name:              taskSpec.Name,
+		SubGroupSize:      &taskSpec.PartitionPolicy.PartitionSize,
+		MinSubGroups:      &taskSpec.PartitionPolicy.MinPartitions,
+		ExpectedSubGroups: append([]int32(nil), taskSpec.PartitionPolicy.ExpectedPartitions...),
 	}
 
 	// Set LabelSelector

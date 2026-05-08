@@ -498,6 +498,11 @@ func (in *SubGroupPolicySpec) DeepCopyInto(out *SubGroupPolicySpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.ExpectedSubGroups != nil {
+		in, out := &in.ExpectedSubGroups, &out.ExpectedSubGroups
+		*out = make([]int32, len(*in))
+		copy(*out, *in)
+	}
 	if in.LabelSelector != nil {
 		in, out := &in.LabelSelector, &out.LabelSelector
 		*out = new(metav1.LabelSelector)

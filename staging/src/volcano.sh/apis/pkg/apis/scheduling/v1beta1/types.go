@@ -249,6 +249,12 @@ type SubGroupPolicySpec struct {
 	// +optional
 	MinSubGroups *int32 `json:"minSubGroups,omitempty" protobuf:"bytes,5,opt,name=minSubGroups"`
 
+	// ExpectedSubGroups defines the exact subgroup counts the scheduler may commit.
+	// Values must be unique, strictly increasing, and start with MinSubGroups when configured.
+	// +listType=atomic
+	// +optional
+	ExpectedSubGroups []int32 `json:"expectedSubGroups,omitempty" protobuf:"bytes,8,rep,name=expectedSubGroups"`
+
 	// LabelSelector is used to find matching pods.
 	// Pods that match this label selector are counted to determine the number of pods
 	// in their corresponding topology domain.

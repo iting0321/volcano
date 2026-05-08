@@ -21,6 +21,7 @@ limitations under the License.
 package api
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -29,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	schedulingv2 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
@@ -717,4 +719,36 @@ func TestParseMinMemberInfoChanged(t *testing.T) {
 			assert.Equal(t, tt.expectedTaskMinAvailableTotal, jobInfo.TaskMinAvailableTotal)
 		})
 	}
+}
+
+func TestCheckSubJobReadyWithExpectedSubJobs(t *testing.T) {
+	job := NewJobInfo("test-job")
+	gid := SubJobGID("test-job/worker")
+	job.MinSubJobs[gid] = 1
+	job.ExpectedSubJobs = map[SubJobGID][]int32{
+		gid: []int32{1, 2, 4},
+	}
+
+	for i := 0; i < 3; i++ {
+		subJob := NewSubJobInfo(gid, SubJobID(fmt.Sprintf("worker-%d", i)), job.UID, &scheduling.SubGroupPolicySpec{
+			SubGroupSize: ptr.To(int32(1)),
+		}, nil)
+		pod := buildPod("default", fmt.Sprintf("worker-%d", i), "node1", v1.PodRunning, BuildResourceList("1", "1G"), nil, map[string]string{})
+		subJob.addTask(NewTaskInfo(pod))
+		job.SubJobs[subJob.UID] = subJob
+	}
+
+	assert.False(t, job.CheckSubJobReady())
+}
+
+func TestSubJobTargetCounts(t *testing.T) {
+	job := NewJobInfo("test-job")
+	gid := SubJobGID("test-job/worker")
+	job.MinSubJobs[gid] = 1
+	job.ExpectedSubJobs = map[SubJobGID][]int32{
+		gid: []int32{1, 2, 4},
+	}
+
+	targets := job.SubJobTargetCounts(map[SubJobGID]int32{gid: 2})
+	assert.Equal(t, int32(4), targets[gid])
 }

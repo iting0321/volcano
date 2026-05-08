@@ -1370,6 +1370,7 @@ func TestGetSubGroupPolicy(t *testing.T) {
 		TaskSpec             v1alpha1.TaskSpec
 		ExpectedMinSubGroups *int32
 		ExpectedSubGroupSize *int32
+		ExpectedSubGroups    []int32
 		Description          string
 	}{
 		{
@@ -1378,9 +1379,10 @@ func TestGetSubGroupPolicy(t *testing.T) {
 				Name:     "task1",
 				Replicas: 6,
 				PartitionPolicy: &v1alpha1.PartitionPolicySpec{
-					TotalPartitions: 2,
-					MinPartitions:   1,
-					PartitionSize:   3,
+					TotalPartitions:    2,
+					MinPartitions:      1,
+					PartitionSize:      3,
+					ExpectedPartitions: []int32{1, 2},
 					NetworkTopology: &v1alpha1.NetworkTopologySpec{
 						Mode:               v1alpha1.HardNetworkTopologyMode,
 						HighestTierAllowed: &highestTierAllowed,
@@ -1389,6 +1391,7 @@ func TestGetSubGroupPolicy(t *testing.T) {
 			},
 			ExpectedMinSubGroups: ptr.To(int32(1)),
 			ExpectedSubGroupSize: ptr.To(int32(3)),
+			ExpectedSubGroups:    []int32{1, 2},
 			Description:          "MinSubGroups should be set to MinPartitions when MinPartitions > 0",
 		},
 		{
@@ -1404,6 +1407,7 @@ func TestGetSubGroupPolicy(t *testing.T) {
 			},
 			ExpectedMinSubGroups: ptr.To(int32(3)),
 			ExpectedSubGroupSize: ptr.To(int32(3)),
+			ExpectedSubGroups:    nil,
 			Description:          "MinSubGroups should equal TotalPartitions when MinPartitions equals TotalPartitions",
 		},
 		{
@@ -1419,6 +1423,7 @@ func TestGetSubGroupPolicy(t *testing.T) {
 			},
 			ExpectedMinSubGroups: ptr.To(int32(0)),
 			ExpectedSubGroupSize: ptr.To(int32(3)),
+			ExpectedSubGroups:    nil,
 			Description:          "MinSubGroups should be nil when MinPartitions is 0",
 		},
 	}
@@ -1456,6 +1461,12 @@ func TestGetSubGroupPolicy(t *testing.T) {
 					t.Errorf("%s: Expected MinSubGroups to be nil, got %d",
 						tc.Description, *result.MinSubGroups)
 				}
+			}
+
+			// Check LabelSelector
+			if !reflect.DeepEqual(result.ExpectedSubGroups, tc.ExpectedSubGroups) {
+				t.Errorf("%s: Expected ExpectedSubGroups=%v, got %v",
+					tc.Description, tc.ExpectedSubGroups, result.ExpectedSubGroups)
 			}
 
 			// Check LabelSelector

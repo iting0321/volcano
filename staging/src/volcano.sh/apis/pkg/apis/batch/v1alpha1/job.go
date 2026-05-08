@@ -300,6 +300,12 @@ type PartitionPolicySpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MinPartitions int32 `json:"minPartitions,omitempty" protobuf:"bytes,4,opt,name=minPartitions"`
+
+	// ExpectedPartitions defines the exact partition counts the scheduler may commit.
+	// Values must be unique, strictly increasing, and start with MinPartitions.
+	// +listType=atomic
+	// +optional
+	ExpectedPartitions []int32 `json:"expectedPartitions,omitempty" protobuf:"bytes,5,rep,name=expectedPartitions"`
 }
 
 // JobPhase defines the phase of the job.
