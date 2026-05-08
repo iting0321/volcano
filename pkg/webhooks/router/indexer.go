@@ -31,6 +31,20 @@ const (
 	NamespaceQueueParentIndexName = "namespaceQueueParent"
 )
 
+func parentIndexValues(namespace, parent string) []string {
+	if parent == "" {
+		return []string{}
+	}
+	if namespace == "" {
+		return []string{parent}
+	}
+	return []string{fmt.Sprintf("%s/%s", namespace, parent)}
+}
+
+func namespaceParentIndexKey(namespace, parent string) string {
+	return fmt.Sprintf("%s/%s", namespace, parent)
+}
+
 // QueueParentIndexFunc is an index function that indexes queues by their parent name
 // This allows efficient lookup of all children of a given parent queue
 func QueueParentIndexFunc(obj interface{}) ([]string, error) {
@@ -39,13 +53,7 @@ func QueueParentIndexFunc(obj interface{}) ([]string, error) {
 		return []string{}, nil
 	}
 
-	// Index by parent name
-	if queue.Spec.Parent != "" {
-		return []string{queue.Spec.Parent}, nil
-	}
-
-	// Root queue or queues without parent
-	return []string{}, nil
+	return parentIndexValues("", queue.Spec.Parent), nil
 }
 
 // NamespaceQueueParentIndexFunc indexes namespace queues by namespace and parent name.
@@ -55,11 +63,7 @@ func NamespaceQueueParentIndexFunc(obj interface{}) ([]string, error) {
 		return []string{}, nil
 	}
 
-	if queue.Spec.Parent != "" {
-		return []string{fmt.Sprintf("%s/%s", queue.Namespace, queue.Spec.Parent)}, nil
-	}
-
-	return []string{}, nil
+	return parentIndexValues(queue.Namespace, queue.Spec.Parent), nil
 }
 
 // GetQueuesByParent returns all queues that have the specified parent using the queue parent index.
@@ -104,7 +108,7 @@ func (asc *AdmissionServiceConfig) GetQueuesByParent(parentName string) ([]*sche
 
 // GetNamespaceQueuesByParent returns all namespace queues in a namespace with the specified parent.
 func (asc *AdmissionServiceConfig) GetNamespaceQueuesByParent(namespace, parentName string) ([]*schedulingv1beta1.NamespaceQueue, error) {
-	indexKey := fmt.Sprintf("%s/%s", namespace, parentName)
+	indexKey := namespaceParentIndexKey(namespace, parentName)
 	if asc.NamespaceQueueInformer != nil {
 		objs, err := asc.NamespaceQueueInformer.GetIndexer().ByIndex(NamespaceQueueParentIndexName, indexKey)
 		if err != nil {

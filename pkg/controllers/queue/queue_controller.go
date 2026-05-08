@@ -45,9 +45,9 @@ import (
 	schedulinglister "volcano.sh/apis/pkg/client/listers/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 	"volcano.sh/volcano/pkg/controllers/framework"
-	queueutil "volcano.sh/volcano/pkg/queue"
 	queuestate "volcano.sh/volcano/pkg/controllers/queue/state"
 	"volcano.sh/volcano/pkg/features"
+	queueutil "volcano.sh/volcano/pkg/queue"
 )
 
 func init() {
@@ -143,9 +143,9 @@ func (c *queuecontroller) Initialize(opt *framework.ControllerOption) error {
 	})
 
 	namespaceQueueInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    c.addNamespaceQueue,
-		UpdateFunc: c.updateNamespaceQueue,
-		DeleteFunc: c.deleteNamespaceQueue,
+		AddFunc:    c.addQueue,
+		UpdateFunc: c.updateQueue,
+		DeleteFunc: c.deleteQueue,
 	})
 
 	pgInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{

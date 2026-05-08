@@ -338,20 +338,7 @@ func (cc *jobcontroller) GetQueueInfo(namespace, queue string) (*scheduling.Queu
 		klog.Errorf("Failed to get queue from listers, error: %s", err.Error())
 		return nil, err
 	}
-	if queueRef.NamespaceQueue != nil {
-		return &scheduling.Queue{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        queueutil.NamespaceKey(queueRef.Namespace, queueRef.Name),
-				Namespace:   queueRef.Namespace,
-				Labels:      queueRef.NamespaceQueue.Labels,
-				Annotations: queueRef.NamespaceQueue.Annotations,
-			},
-			Spec:   queueRef.NamespaceQueue.Spec,
-			Status: queueRef.NamespaceQueue.Status,
-		}, nil
-	}
-
-	return queueRef.Queue, nil
+	return queueRef.AsQueue(), nil
 }
 
 func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.UpdateStatusFn) error {

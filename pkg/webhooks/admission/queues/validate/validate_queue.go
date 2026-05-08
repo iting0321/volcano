@@ -69,6 +69,35 @@ var service = &router.AdmissionService{
 
 var config = &router.AdmissionServiceConfig{}
 
+type queueValidationView interface {
+	queueName() string
+	queueSpec() *schedulingv1beta1.QueueSpec
+	queueStatus() *schedulingv1beta1.QueueStatus
+}
+
+type queueValidationAdapter struct {
+	name   string
+	spec   *schedulingv1beta1.QueueSpec
+	status *schedulingv1beta1.QueueStatus
+}
+
+func (a queueValidationAdapter) queueName() string {
+	return a.name
+}
+
+func (a queueValidationAdapter) queueSpec() *schedulingv1beta1.QueueSpec {
+	return a.spec
+}
+
+func (a queueValidationAdapter) queueStatus() *schedulingv1beta1.QueueStatus {
+	return a.status
+}
+
+type queueValidationOptions struct {
+	disallowRootName   bool
+	disallowSelfParent bool
+}
+
 // AdmitQueues is to admit queues and return response.
 func AdmitQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	klog.V(3).Infof("Admitting %s queue %s.", ar.Request.Operation, ar.Request.Name)
@@ -134,18 +163,36 @@ func AdmitQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse 
 }
 
 func validateQueue(queue *schedulingv1beta1.Queue) error {
-	errs := field.ErrorList{}
-	resourcePath := field.NewPath("requestBody")
-
-	errs = append(errs, validateResourceQuantityOfQueue(queue.Spec, resourcePath.Child("spec"))...)
-	errs = append(errs, validateStateOfQueue(queue.Status.State, resourcePath.Child("spec").Child("state"))...)
-	errs = append(errs, validateHierarchicalAttributes(queue, resourcePath.Child("metadata").Child("annotations"))...)
+	errs := validateQueueCommon(queueValidationAdapter{
+		name:   queue.Name,
+		spec:   &queue.Spec,
+		status: &queue.Status,
+	}, queueValidationOptions{})
+	errs = append(errs, validateHierarchicalAttributes(queue, field.NewPath("requestBody").Child("metadata").Child("annotations"))...)
 
 	if len(errs) > 0 {
 		return errs.ToAggregate()
 	}
 
 	return nil
+}
+
+func validateQueueCommon(queue queueValidationView, opts queueValidationOptions) field.ErrorList {
+	errs := field.ErrorList{}
+	resourcePath := field.NewPath("requestBody")
+	spec := queue.queueSpec()
+	status := queue.queueStatus()
+
+	errs = append(errs, validateResourceQuantityOfQueue(*spec, resourcePath.Child("spec"))...)
+	errs = append(errs, validateStateOfQueue(status.State, resourcePath.Child("spec").Child("state"))...)
+	if opts.disallowRootName && queue.queueName() == "root" {
+		errs = append(errs, field.Invalid(resourcePath.Child("metadata").Child("name"), queue.queueName(), "namespace queue name `root` is reserved"))
+	}
+	if opts.disallowSelfParent && spec.Parent == queue.queueName() {
+		errs = append(errs, field.Invalid(resourcePath.Child("spec").Child("parent"), spec.Parent, "queue cannot use itself as parent"))
+	}
+
+	return errs
 }
 
 func validateHierarchicalAttributes(queue *schedulingv1beta1.Queue, fldPath *field.Path) field.ErrorList {
@@ -724,16 +771,11 @@ func admitNamespaceQueues(ar admissionv1.AdmissionReview) *admissionv1.Admission
 }
 
 func validateNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
-	errs := field.ErrorList{}
-	resourcePath := field.NewPath("requestBody")
-	errs = append(errs, validateResourceQuantityOfQueue(queue.Spec, resourcePath.Child("spec"))...)
-	errs = append(errs, validateStateOfQueue(queue.Status.State, resourcePath.Child("spec").Child("state"))...)
-	if queue.Name == "root" {
-		errs = append(errs, field.Invalid(resourcePath.Child("metadata").Child("name"), queue.Name, "namespace queue name `root` is reserved"))
-	}
-	if queue.Spec.Parent == queue.Name {
-		errs = append(errs, field.Invalid(resourcePath.Child("spec").Child("parent"), queue.Spec.Parent, "namespace queue cannot use itself as parent"))
-	}
+	errs := validateQueueCommon(queueValidationAdapter{
+		name:   queue.Name,
+		spec:   &queue.Spec,
+		status: &queue.Status,
+	}, queueValidationOptions{disallowRootName: true, disallowSelfParent: true})
 	if len(errs) > 0 {
 		return errs.ToAggregate()
 	}

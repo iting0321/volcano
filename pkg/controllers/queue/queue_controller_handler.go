@@ -27,28 +27,24 @@ import (
 	queueutil "volcano.sh/volcano/pkg/queue"
 )
 
+type queueHandlerView struct {
+	key    string
+	parent string
+}
+
 func (c *queuecontroller) enqueue(req *apis.Request) {
 	c.queue.Add(req)
 }
 
 func (c *queuecontroller) addQueue(obj interface{}) {
-	queue := obj.(*schedulingv1beta1.Queue)
-
-	req := &apis.Request{
-		QueueName: queueutil.ClusterKey(queue.Name),
-
-		Event:  busv1alpha1.OutOfSyncEvent,
-		Action: busv1alpha1.SyncQueueAction,
+	queue, ok := getQueueHandlerView(obj)
+	if !ok {
+		klog.Errorf("Obj %v is not queue.", obj)
+		return
 	}
 
-	c.enqueue(req)
-}
-
-func (c *queuecontroller) addNamespaceQueue(obj interface{}) {
-	queue := obj.(*schedulingv1beta1.NamespaceQueue)
-
 	req := &apis.Request{
-		QueueName: queueutil.NamespaceKey(queue.Namespace, queue.Name),
+		QueueName: queue.key,
 		Event:     busv1alpha1.OutOfSyncEvent,
 		Action:    busv1alpha1.SyncQueueAction,
 	}
@@ -57,62 +53,32 @@ func (c *queuecontroller) addNamespaceQueue(obj interface{}) {
 }
 
 func (c *queuecontroller) deleteQueue(obj interface{}) {
-	queue, ok := obj.(*schedulingv1beta1.Queue)
+	queue, ok := getQueueHandlerViewFromTombstone(obj)
 	if !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			klog.Errorf("Couldn't get object from tombstone %#v.", obj)
-			return
-		}
-		queue, ok = tombstone.Obj.(*schedulingv1beta1.Queue)
-		if !ok {
-			klog.Errorf("Tombstone contained object that is not a Queue: %#v.", obj)
-			return
-		}
+		klog.Errorf("Couldn't get queue object %#v.", obj)
+		return
 	}
 
-	metrics.DeleteQueueMetrics(queue.Name)
+	metrics.DeleteQueueMetrics(queue.key)
 	c.pgMutex.Lock()
 	defer c.pgMutex.Unlock()
-	delete(c.podGroups, queueutil.ClusterKey(queue.Name))
-}
-
-func (c *queuecontroller) deleteNamespaceQueue(obj interface{}) {
-	queue, ok := obj.(*schedulingv1beta1.NamespaceQueue)
-	if !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			klog.Errorf("Couldn't get object from tombstone %#v.", obj)
-			return
-		}
-		queue, ok = tombstone.Obj.(*schedulingv1beta1.NamespaceQueue)
-		if !ok {
-			klog.Errorf("Tombstone contained object that is not a NamespaceQueue: %#v.", obj)
-			return
-		}
-	}
-
-	metrics.DeleteQueueMetrics(queueutil.NamespaceKey(queue.Namespace, queue.Name))
-	c.pgMutex.Lock()
-	defer c.pgMutex.Unlock()
-	delete(c.podGroups, queueutil.NamespaceKey(queue.Namespace, queue.Name))
+	delete(c.podGroups, queue.key)
 }
 
 func (c *queuecontroller) updateQueue(oldObj, newObj interface{}) {
-	oldQueue := oldObj.(*schedulingv1beta1.Queue)
-	newQueue := newObj.(*schedulingv1beta1.Queue)
-
-	if oldQueue.Spec.Parent != newQueue.Spec.Parent {
-		c.addQueue(newObj)
+	oldQueue, ok := getQueueHandlerView(oldObj)
+	if !ok {
+		klog.Errorf("Old object %v is not queue.", oldObj)
+		return
 	}
-}
+	newQueue, ok := getQueueHandlerView(newObj)
+	if !ok {
+		klog.Errorf("New object %v is not queue.", newObj)
+		return
+	}
 
-func (c *queuecontroller) updateNamespaceQueue(oldObj, newObj interface{}) {
-	oldQueue := oldObj.(*schedulingv1beta1.NamespaceQueue)
-	newQueue := newObj.(*schedulingv1beta1.NamespaceQueue)
-
-	if oldQueue.Spec.Parent != newQueue.Spec.Parent {
-		c.addNamespaceQueue(newObj)
+	if oldQueue.parent != newQueue.parent {
+		c.addQueue(newObj)
 	}
 }
 
@@ -246,4 +212,34 @@ func (c *queuecontroller) resolveQueueKey(namespace, queueName string) string {
 		return queueutil.ClusterKey(queueName)
 	}
 	return resolved.Key
+}
+
+func getQueueHandlerView(obj interface{}) (queueHandlerView, bool) {
+	switch queue := obj.(type) {
+	case *schedulingv1beta1.Queue:
+		return queueHandlerView{
+			key:    queueutil.ClusterKey(queue.Name),
+			parent: queue.Spec.Parent,
+		}, true
+	case *schedulingv1beta1.NamespaceQueue:
+		return queueHandlerView{
+			key:    queueutil.NamespaceKey(queue.Namespace, queue.Name),
+			parent: queue.Spec.Parent,
+		}, true
+	default:
+		return queueHandlerView{}, false
+	}
+}
+
+func getQueueHandlerViewFromTombstone(obj interface{}) (queueHandlerView, bool) {
+	if queue, ok := getQueueHandlerView(obj); ok {
+		return queue, true
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return queueHandlerView{}, false
+	}
+
+	return getQueueHandlerView(tombstone.Obj)
 }

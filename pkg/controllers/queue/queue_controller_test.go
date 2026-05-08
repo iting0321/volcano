@@ -306,6 +306,83 @@ func TestSyncQueue(t *testing.T) {
 	}
 }
 
+func TestNamespaceQueueStateTransitions(t *testing.T) {
+	testCases := []struct {
+		name          string
+		queue         *schedulingv1beta1.NamespaceQueue
+		podGroups     []string
+		action        func(*queuecontroller, *schedulingv1beta1.NamespaceQueue) error
+		expectedState schedulingv1beta1.QueueState
+	}{
+		{
+			name: "sync empty state to open",
+			queue: &schedulingv1beta1.NamespaceQueue{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ns1",
+					Name:      "q1",
+				},
+			},
+			action: func(c *queuecontroller, queue *schedulingv1beta1.NamespaceQueue) error {
+				return c.syncNamespaceQueue(queue)
+			},
+			expectedState: schedulingv1beta1.QueueStateOpen,
+		},
+		{
+			name: "close namespace queue with running podgroups",
+			queue: &schedulingv1beta1.NamespaceQueue{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ns1",
+					Name:      "q2",
+				},
+				Status: schedulingv1beta1.QueueStatus{
+					State: schedulingv1beta1.QueueStateOpen,
+				},
+			},
+			podGroups: []string{"ns1/pg1"},
+			action: func(c *queuecontroller, queue *schedulingv1beta1.NamespaceQueue) error {
+				return c.closeNamespaceQueue(queue)
+			},
+			expectedState: schedulingv1beta1.QueueStateClosing,
+		},
+		{
+			name: "close namespace queue without podgroups",
+			queue: &schedulingv1beta1.NamespaceQueue{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "ns1",
+					Name:      "q3",
+				},
+				Status: schedulingv1beta1.QueueStatus{
+					State: schedulingv1beta1.QueueStateOpen,
+				},
+			},
+			action: func(c *queuecontroller, queue *schedulingv1beta1.NamespaceQueue) error {
+				return c.closeNamespaceQueue(queue)
+			},
+			expectedState: schedulingv1beta1.QueueStateClosed,
+		},
+	}
+
+	for _, testcase := range testCases {
+		c := newFakeController()
+
+		_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(testcase.queue.Namespace).Create(context.TODO(), testcase.queue, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		queueKey := queueutil.NamespaceKey(testcase.queue.Namespace, testcase.queue.Name)
+		c.podGroups[queueKey] = make(map[string]struct{}, len(testcase.podGroups))
+		for _, pgKey := range testcase.podGroups {
+			c.podGroups[queueKey][pgKey] = struct{}{}
+		}
+
+		err = testcase.action(c, testcase.queue)
+		assert.NoError(t, err)
+
+		item, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(testcase.queue.Namespace).Get(context.TODO(), testcase.queue.Name, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, testcase.expectedState, item.Status.State)
+	}
+}
+
 func TestProcessNextWorkItem(t *testing.T) {
 	testCases := []struct {
 		Name        string

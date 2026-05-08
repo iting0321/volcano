@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	schedulinglister "volcano.sh/apis/pkg/client/listers/scheduling/v1beta1"
 )
@@ -31,6 +32,31 @@ type ResolvedReference struct {
 	Name           string
 	Queue          *schedulingv1beta1.Queue
 	NamespaceQueue *schedulingv1beta1.NamespaceQueue
+}
+
+// AsQueue returns a queue-shaped view of the resolved reference so callers can
+// reuse the existing queue-based logic for namespace queues.
+func (r *ResolvedReference) AsQueue() *schedulingv1beta1.Queue {
+	if r == nil {
+		return nil
+	}
+	if r.Queue != nil {
+		return r.Queue
+	}
+	if r.NamespaceQueue == nil {
+		return nil
+	}
+
+	return &schedulingv1beta1.Queue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        NamespaceKey(r.Namespace, r.Name),
+			Namespace:   r.Namespace,
+			Labels:      r.NamespaceQueue.Labels,
+			Annotations: r.NamespaceQueue.Annotations,
+		},
+		Spec:   r.NamespaceQueue.Spec,
+		Status: r.NamespaceQueue.Status,
+	}
 }
 
 // Resolve finds a NamespaceQueue in the workload namespace first and falls back to a cluster Queue.

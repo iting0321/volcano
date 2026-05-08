@@ -37,8 +37,8 @@ import (
 	v1beta1apply "volcano.sh/apis/pkg/client/applyconfiguration/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 	"volcano.sh/volcano/pkg/controllers/metrics"
-	queueutil "volcano.sh/volcano/pkg/queue"
 	"volcano.sh/volcano/pkg/controllers/queue/state"
+	queueutil "volcano.sh/volcano/pkg/queue"
 )
 
 const (
@@ -47,33 +47,74 @@ const (
 	ClosedByParentAnnotationFalseValue = "false"
 )
 
-func (c *queuecontroller) syncQueue(queue *schedulingv1beta1.Queue, updateStateFn state.UpdateQueueStatusFn) error {
-	klog.V(4).Infof("Begin to sync queue %s.", queue.Name)
-	defer klog.V(4).Infof("End sync queue %s.", queue.Name)
+type queueStatusAdapter interface {
+	key() string
+	currentStatus() *schedulingv1beta1.QueueStatus
+	syncStatus(status *schedulingv1beta1.QueueStatus, podGroups []string)
+	openStatus(status *schedulingv1beta1.QueueStatus)
+	closeStatus(status *schedulingv1beta1.QueueStatus, podGroups []string)
+	persistStatus(status *schedulingv1beta1.QueueStatus) error
+}
 
-	// add parent queue if parent not specified
-	queue, err := c.updateQueueParent(queue)
-	if err != nil {
-		return err
-	}
+type queueStatusAdapterFuncs struct {
+	queueKey  string
+	getStatus func() *schedulingv1beta1.QueueStatus
+	syncFn    func(status *schedulingv1beta1.QueueStatus, podGroups []string)
+	openFn    func(status *schedulingv1beta1.QueueStatus)
+	closeFn   func(status *schedulingv1beta1.QueueStatus, podGroups []string)
+	persistFn func(status *schedulingv1beta1.QueueStatus) error
+}
 
-	queueKey := queueutil.ClusterKey(queue.Name)
+func (a *queueStatusAdapterFuncs) key() string {
+	return a.queueKey
+}
+
+func (a *queueStatusAdapterFuncs) currentStatus() *schedulingv1beta1.QueueStatus {
+	return a.getStatus()
+}
+
+func (a *queueStatusAdapterFuncs) syncStatus(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+	a.syncFn(status, podGroups)
+}
+
+func (a *queueStatusAdapterFuncs) openStatus(status *schedulingv1beta1.QueueStatus) {
+	a.openFn(status)
+}
+
+func (a *queueStatusAdapterFuncs) closeStatus(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+	a.closeFn(status, podGroups)
+}
+
+func (a *queueStatusAdapterFuncs) persistStatus(status *schedulingv1beta1.QueueStatus) error {
+	return a.persistFn(status)
+}
+
+func resetQueuePodGroupCounters(status *schedulingv1beta1.QueueStatus) {
+	status.Pending = 0
+	status.Running = 0
+	status.Unknown = 0
+	status.Inqueue = 0
+	status.Completed = 0
+}
+
+func (c *queuecontroller) buildQueueStatus(queueKey string, baseStatus *schedulingv1beta1.QueueStatus) (*schedulingv1beta1.QueueStatus, []string, error) {
 	podGroups := c.getPodGroups(queueKey)
-	queueStatus := schedulingv1beta1.QueueStatus{}
+	queueStatus := baseStatus.DeepCopy()
+	resetQueuePodGroupCounters(queueStatus)
 
 	for _, pgKey := range podGroups {
-		// Ignore error here, tt can not occur.
+		// Ignore error here, it cannot occur.
 		ns, name, _ := cache.SplitMetaNamespaceKey(pgKey)
 
 		pg, err := c.pgLister.PodGroups(ns).Get(name)
 		if err != nil {
 			if !errors.IsNotFound(err) {
-				return err
+				return nil, nil, err
 			}
 
 			klog.V(4).Infof("The podGroup %s is not found, skip it and continue to sync cache", pgKey)
 			c.pgMutex.Lock()
-				delete(c.podGroups[queueKey], pgKey)
+			delete(c.podGroups[queueKey], pgKey)
 			c.pgMutex.Unlock()
 			continue
 		}
@@ -92,24 +133,88 @@ func (c *queuecontroller) syncQueue(queue *schedulingv1beta1.Queue, updateStateF
 		}
 	}
 
-	// Update the metrics
-	metrics.UpdateQueueMetrics(queueKey, &queueStatus)
+	return queueStatus, podGroups, nil
+}
 
-	if updateStateFn != nil {
-		updateStateFn(&queueStatus, podGroups)
-	} else {
-		queueStatus.State = queue.Status.State
+func (c *queuecontroller) syncQueueStatus(adapter queueStatusAdapter) error {
+	queueStatus, podGroups, err := c.buildQueueStatus(adapter.key(), adapter.currentStatus())
+	if err != nil {
+		return err
 	}
 
-	newQueue := queue.DeepCopy()
-	// ignore update when state does not change
-	if queueStatus.State != queue.Status.State {
-		queueStatusApply := v1beta1apply.QueueStatus().WithState(queueStatus.State)
-		queueApply := v1beta1apply.Queue(queue.Name).WithStatus(queueStatusApply)
-		if newQueue, err = c.vcClient.SchedulingV1beta1().Queues().ApplyStatus(context.TODO(), queueApply, metav1.ApplyOptions{FieldManager: controllerName}); err != nil {
-			klog.Errorf("Update queue state from %s to %s failed for %v", queue.Status.State, queueStatus.State, err)
-			return err
-		}
+	adapter.syncStatus(queueStatus, podGroups)
+	metrics.UpdateQueueMetrics(adapter.key(), queueStatus)
+
+	return adapter.persistStatus(queueStatus)
+}
+
+func (c *queuecontroller) openQueueStatus(adapter queueStatusAdapter) error {
+	queueStatus := adapter.currentStatus().DeepCopy()
+	adapter.openStatus(queueStatus)
+	return adapter.persistStatus(queueStatus)
+}
+
+func (c *queuecontroller) closeQueueStatus(adapter queueStatusAdapter) error {
+	queueStatus := adapter.currentStatus().DeepCopy()
+	adapter.closeStatus(queueStatus, c.getPodGroups(adapter.key()))
+	return adapter.persistStatus(queueStatus)
+}
+
+func (c *queuecontroller) syncQueue(queue *schedulingv1beta1.Queue, updateStateFn state.UpdateQueueStatusFn) error {
+	klog.V(4).Infof("Begin to sync queue %s.", queue.Name)
+	defer klog.V(4).Infof("End sync queue %s.", queue.Name)
+
+	// add parent queue if parent not specified
+	queue, err := c.updateQueueParent(queue)
+	if err != nil {
+		return err
+	}
+
+	var newQueue *schedulingv1beta1.Queue
+	adapter := &queueStatusAdapterFuncs{
+		queueKey: queueutil.ClusterKey(queue.Name),
+		getStatus: func() *schedulingv1beta1.QueueStatus {
+			return queue.Status.DeepCopy()
+		},
+		syncFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+			if updateStateFn != nil {
+				updateStateFn(status, podGroups)
+				return
+			}
+			status.State = queue.Status.State
+		},
+		openFn: func(status *schedulingv1beta1.QueueStatus) {
+			if updateStateFn != nil {
+				updateStateFn(status, nil)
+			}
+		},
+		closeFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+			if updateStateFn != nil {
+				updateStateFn(status, podGroups)
+			}
+		},
+		persistFn: func(status *schedulingv1beta1.QueueStatus) error {
+			newQueue = queue.DeepCopy()
+			if status.State == queue.Status.State {
+				return nil
+			}
+
+			queueStatusApply := v1beta1apply.QueueStatus().WithState(status.State)
+			queueApply := v1beta1apply.Queue(queue.Name).WithStatus(queueStatusApply)
+			var applyErr error
+			if newQueue, applyErr = c.vcClient.SchedulingV1beta1().Queues().ApplyStatus(context.TODO(), queueApply, metav1.ApplyOptions{FieldManager: controllerName}); applyErr != nil {
+				klog.Errorf("Update queue state from %s to %s failed for %v", queue.Status.State, status.State, applyErr)
+				return applyErr
+			}
+			return nil
+		},
+	}
+
+	if err := c.syncQueueStatus(adapter); err != nil {
+		return err
+	}
+	if newQueue == nil {
+		newQueue = queue.DeepCopy()
 	}
 
 	return c.syncHierarchicalQueue(newQueue)
@@ -126,22 +231,40 @@ func (c *queuecontroller) openQueue(queue *schedulingv1beta1.Queue, updateStateF
 	}
 
 	newQueue := queue.DeepCopy()
-	if updateStateFn != nil {
-		updateStateFn(&newQueue.Status, nil)
+	err := c.openQueueStatus(&queueStatusAdapterFuncs{
+		queueKey: queueutil.ClusterKey(queue.Name),
+		getStatus: func() *schedulingv1beta1.QueueStatus {
+			return queue.Status.DeepCopy()
+		},
+		syncFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {},
+		openFn: func(status *schedulingv1beta1.QueueStatus) {
+			if updateStateFn != nil {
+				updateStateFn(status, nil)
+			}
+		},
+		closeFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {},
+		persistFn: func(status *schedulingv1beta1.QueueStatus) error {
+			newQueue.Status = *status
+			if queue.Status.State == status.State {
+				return nil
+			}
+
+			queueStatusApply := v1beta1apply.QueueStatus().WithState(status.State)
+			queueApply := v1beta1apply.Queue(queue.Name).WithStatus(queueStatusApply)
+			if _, err := c.vcClient.SchedulingV1beta1().Queues().ApplyStatus(context.TODO(), queueApply, metav1.ApplyOptions{FieldManager: controllerName}); err != nil {
+				c.recorder.Event(newQueue, v1.EventTypeWarning, string(v1alpha1.OpenQueueAction),
+					fmt.Sprintf("Update queue status from %s to %s failed for %v",
+						queue.Status.State, newQueue.Status.State, err))
+				return err
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return err
 	}
 
-	if queue.Status.State != newQueue.Status.State {
-		queueStatusApply := v1beta1apply.QueueStatus().WithState(newQueue.Status.State)
-		queueApply := v1beta1apply.Queue(queue.Name).WithStatus(queueStatusApply)
-		if _, err := c.vcClient.SchedulingV1beta1().Queues().ApplyStatus(context.TODO(), queueApply, metav1.ApplyOptions{FieldManager: controllerName}); err != nil {
-			c.recorder.Event(newQueue, v1.EventTypeWarning, string(v1alpha1.OpenQueueAction),
-				fmt.Sprintf("Update queue status from %s to %s failed for %v",
-					queue.Status.State, newQueue.Status.State, err))
-			return err
-		}
-	}
-
-	_, err := c.updateQueueAnnotation(queue, ClosedByParentAnnotationKey, ClosedByParentAnnotationFalseValue)
+	_, err = c.updateQueueAnnotation(queue, ClosedByParentAnnotationKey, ClosedByParentAnnotationFalseValue)
 	return err
 }
 
@@ -155,21 +278,38 @@ func (c *queuecontroller) closeQueue(queue *schedulingv1beta1.Queue, updateState
 		}
 	}
 
-	podGroups := c.getPodGroups(queueutil.ClusterKey(queue.Name))
 	newQueue := queue.DeepCopy()
-	if updateStateFn != nil {
-		updateStateFn(&newQueue.Status, podGroups)
-	}
+	err := c.closeQueueStatus(&queueStatusAdapterFuncs{
+		queueKey: queueutil.ClusterKey(queue.Name),
+		getStatus: func() *schedulingv1beta1.QueueStatus {
+			return queue.Status.DeepCopy()
+		},
+		syncFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {},
+		openFn: func(status *schedulingv1beta1.QueueStatus) {},
+		closeFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+			if updateStateFn != nil {
+				updateStateFn(status, podGroups)
+			}
+		},
+		persistFn: func(status *schedulingv1beta1.QueueStatus) error {
+			newQueue.Status = *status
+			if queue.Status.State == status.State {
+				return nil
+			}
 
-	if queue.Status.State != newQueue.Status.State {
-		queueStatusApply := v1beta1apply.QueueStatus().WithState(newQueue.Status.State)
-		queueApply := v1beta1apply.Queue(queue.Name).WithStatus(queueStatusApply)
-		if _, err := c.vcClient.SchedulingV1beta1().Queues().ApplyStatus(context.TODO(), queueApply, metav1.ApplyOptions{FieldManager: controllerName}); err != nil {
-			c.recorder.Event(newQueue, v1.EventTypeWarning, string(v1alpha1.CloseQueueAction),
-				fmt.Sprintf("Close queue failed for %v", err))
-			return err
-		}
-		c.recorder.Event(newQueue, v1.EventTypeNormal, string(v1alpha1.CloseQueueAction), "Close queue succeed")
+			queueStatusApply := v1beta1apply.QueueStatus().WithState(status.State)
+			queueApply := v1beta1apply.Queue(queue.Name).WithStatus(queueStatusApply)
+			if _, err := c.vcClient.SchedulingV1beta1().Queues().ApplyStatus(context.TODO(), queueApply, metav1.ApplyOptions{FieldManager: controllerName}); err != nil {
+				c.recorder.Event(newQueue, v1.EventTypeWarning, string(v1alpha1.CloseQueueAction),
+					fmt.Sprintf("Close queue failed for %v", err))
+				return err
+			}
+			c.recorder.Event(newQueue, v1.EventTypeNormal, string(v1alpha1.CloseQueueAction), "Close queue succeed")
+			return nil
+		},
+	})
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -188,78 +328,93 @@ func (c *queuecontroller) handleNamespaceQueue(req *apis.Request, queue *schedul
 }
 
 func (c *queuecontroller) syncNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
-	queueKey := queueutil.NamespaceKey(queue.Namespace, queue.Name)
-	podGroups := c.getPodGroups(queueKey)
-	queueStatus := queue.Status.DeepCopy()
-	queueStatus.Pending = 0
-	queueStatus.Running = 0
-	queueStatus.Unknown = 0
-	queueStatus.Inqueue = 0
-	queueStatus.Completed = 0
-
-	for _, pgKey := range podGroups {
-		ns, name, _ := cache.SplitMetaNamespaceKey(pgKey)
-		pg, err := c.pgLister.PodGroups(ns).Get(name)
-		if err != nil {
-			if !errors.IsNotFound(err) {
-				return err
+	return c.syncQueueStatus(&queueStatusAdapterFuncs{
+		queueKey: queueutil.NamespaceKey(queue.Namespace, queue.Name),
+		getStatus: func() *schedulingv1beta1.QueueStatus {
+			return queue.Status.DeepCopy()
+		},
+		syncFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+			if queue.Status.State == schedulingv1beta1.QueueStateClosed && len(podGroups) > 0 {
+				status.State = schedulingv1beta1.QueueStateClosing
+			} else if queue.Status.State == schedulingv1beta1.QueueStateClosing && len(podGroups) == 0 {
+				status.State = schedulingv1beta1.QueueStateClosed
+			} else if queue.Status.State == "" {
+				status.State = schedulingv1beta1.QueueStateOpen
+			} else {
+				status.State = queue.Status.State
 			}
-			c.pgMutex.Lock()
-			delete(c.podGroups[queueKey], pgKey)
-			c.pgMutex.Unlock()
-			continue
-		}
-		switch pg.Status.Phase {
-		case schedulingv1beta1.PodGroupPending:
-			queueStatus.Pending++
-		case schedulingv1beta1.PodGroupRunning:
-			queueStatus.Running++
-		case schedulingv1beta1.PodGroupUnknown:
-			queueStatus.Unknown++
-		case schedulingv1beta1.PodGroupInqueue:
-			queueStatus.Inqueue++
-		case schedulingv1beta1.PodGroupCompleted:
-			queueStatus.Completed++
-		}
-	}
+		},
+		openFn: func(status *schedulingv1beta1.QueueStatus) {
+			status.State = schedulingv1beta1.QueueStateOpen
+		},
+		closeFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+			if len(podGroups) == 0 {
+				status.State = schedulingv1beta1.QueueStateClosed
+				return
+			}
+			status.State = schedulingv1beta1.QueueStateClosing
+		},
+		persistFn: func(status *schedulingv1beta1.QueueStatus) error {
+			if equality.Semantic.DeepEqual(queue.Status, *status) {
+				return nil
+			}
 
-	if queue.Status.State == schedulingv1beta1.QueueStateClosed && len(podGroups) > 0 {
-		queueStatus.State = schedulingv1beta1.QueueStateClosing
-	} else if queue.Status.State == schedulingv1beta1.QueueStateClosing && len(podGroups) == 0 {
-		queueStatus.State = schedulingv1beta1.QueueStateClosed
-	} else if queue.Status.State == "" {
-		queueStatus.State = schedulingv1beta1.QueueStateOpen
-	} else {
-		queueStatus.State = queue.Status.State
-	}
-
-	metrics.UpdateQueueMetrics(queueKey, queueStatus)
-	if equality.Semantic.DeepEqual(queue.Status, *queueStatus) {
-		return nil
-	}
-
-	newQueue := queue.DeepCopy()
-	newQueue.Status = *queueStatus
-	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
-	return err
+			newQueue := queue.DeepCopy()
+			newQueue.Status = *status
+			_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
+			return err
+		},
+	})
 }
 
 func (c *queuecontroller) openNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
-	newQueue := queue.DeepCopy()
-	newQueue.Status.State = schedulingv1beta1.QueueStateOpen
-	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
-	return err
+	return c.openQueueStatus(&queueStatusAdapterFuncs{
+		queueKey: queueutil.NamespaceKey(queue.Namespace, queue.Name),
+		getStatus: func() *schedulingv1beta1.QueueStatus {
+			return queue.Status.DeepCopy()
+		},
+		syncFn:  func(status *schedulingv1beta1.QueueStatus, podGroups []string) {},
+		openFn:  func(status *schedulingv1beta1.QueueStatus) { status.State = schedulingv1beta1.QueueStateOpen },
+		closeFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {},
+		persistFn: func(status *schedulingv1beta1.QueueStatus) error {
+			if equality.Semantic.DeepEqual(queue.Status, *status) {
+				return nil
+			}
+
+			newQueue := queue.DeepCopy()
+			newQueue.Status = *status
+			_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
+			return err
+		},
+	})
 }
 
 func (c *queuecontroller) closeNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
-	newQueue := queue.DeepCopy()
-	if len(c.getPodGroups(queueutil.NamespaceKey(queue.Namespace, queue.Name))) == 0 {
-		newQueue.Status.State = schedulingv1beta1.QueueStateClosed
-	} else {
-		newQueue.Status.State = schedulingv1beta1.QueueStateClosing
-	}
-	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
-	return err
+	return c.closeQueueStatus(&queueStatusAdapterFuncs{
+		queueKey: queueutil.NamespaceKey(queue.Namespace, queue.Name),
+		getStatus: func() *schedulingv1beta1.QueueStatus {
+			return queue.Status.DeepCopy()
+		},
+		syncFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {},
+		openFn: func(status *schedulingv1beta1.QueueStatus) {},
+		closeFn: func(status *schedulingv1beta1.QueueStatus, podGroups []string) {
+			if len(podGroups) == 0 {
+				status.State = schedulingv1beta1.QueueStateClosed
+				return
+			}
+			status.State = schedulingv1beta1.QueueStateClosing
+		},
+		persistFn: func(status *schedulingv1beta1.QueueStatus) error {
+			if equality.Semantic.DeepEqual(queue.Status, *status) {
+				return nil
+			}
+
+			newQueue := queue.DeepCopy()
+			newQueue.Status = *status
+			_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
+			return err
+		},
+	})
 }
 
 // sync the state between parent and child queues

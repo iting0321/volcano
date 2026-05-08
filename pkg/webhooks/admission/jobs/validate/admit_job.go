@@ -25,7 +25,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -203,45 +202,7 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionR
 	if err != nil {
 		msg += fmt.Sprintf(" unable to find job queue: %v;", err)
 	} else {
-		if queueRef.NamespaceQueue != nil {
-			if queueRef.NamespaceQueue.Status.State != schedulingv1beta1.QueueStateOpen {
-				msg += fmt.Sprintf(" can only submit job to queue with state `Open`, "+
-					"queue `%s/%s` status is `%s`;", queueRef.Namespace, queueRef.Name, queueRef.NamespaceQueue.Status.State)
-			}
-			childQueues, err := config.GetNamespaceQueuesByParent(queueRef.Namespace, queueRef.Name)
-			if err != nil {
-				msg += fmt.Sprintf("failed to get list namespace queues: %v;", err)
-			}
-			if len(childQueues) > 0 {
-				msg += fmt.Sprintf(" can only submit job to leaf queue, queue `%s/%s` has %d child queues;",
-					queueRef.Namespace, queueRef.Name, len(childQueues))
-			}
-		} else {
-			queue := queueRef.Queue
-			if queue.Status.State != schedulingv1beta1.QueueStateOpen {
-				msg += fmt.Sprintf(" can only submit job to queue with state `Open`, "+
-					"queue `%s` status is `%s`;", queue.Name, queue.Status.State)
-			}
-
-			// validate hierarchical queue
-			if queue.Name == "root" {
-				msg += " can not submit job to root queue;"
-			} else {
-				queueList, err := config.QueueLister.List(labels.Everything())
-				if err != nil {
-					msg += fmt.Sprintf("failed to get list queues: %v;", err)
-				}
-				childQueues := make([]*schedulingv1beta1.Queue, 0)
-				for _, childQueue := range queueList {
-					if childQueue.Spec.Parent == queue.Name {
-						childQueues = append(childQueues, childQueue)
-					}
-				}
-				if len(childQueues) > 0 {
-					msg += fmt.Sprintf(" can only submit job to leaf queue, "+"queue `%s` has %d child queues;", queue.Name, len(childQueues))
-				}
-			}
-		}
+		msg += validateJobQueueSubmission(queueRef)
 	}
 
 	if hasDependenciesBetweenTasks {
@@ -256,6 +217,57 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionR
 	}
 
 	return msg
+}
+
+func validateJobQueueSubmission(queueRef *queueutil.ResolvedReference) string {
+	queue := queueRef.AsQueue()
+	if queue == nil {
+		return fmt.Sprintf(" unable to find job queue: queue `%s` resolved to nil;", queueRef.Name)
+	}
+
+	var msg string
+	if queue.Status.State != schedulingv1beta1.QueueStateOpen {
+		msg += fmt.Sprintf(" can only submit job to queue with state `Open`, queue `%s` status is `%s`;",
+			jobQueueDisplayName(queueRef), queue.Status.State)
+	}
+
+	if queueRef.Scope == queueutil.ClusterQueueScope && queueRef.Name == "root" {
+		return msg + " can not submit job to root queue;"
+	}
+
+	childQueueCount, err := getJobSubmissionChildQueueCount(queueRef)
+	if err != nil {
+		return msg + err.Error()
+	}
+	if childQueueCount > 0 {
+		msg += fmt.Sprintf(" can only submit job to leaf queue, queue `%s` has %d child queues;",
+			jobQueueDisplayName(queueRef), childQueueCount)
+	}
+
+	return msg
+}
+
+func getJobSubmissionChildQueueCount(queueRef *queueutil.ResolvedReference) (int, error) {
+	if queueRef.Scope == queueutil.NamespaceQueueScope {
+		childQueues, err := config.GetNamespaceQueuesByParent(queueRef.Namespace, queueRef.Name)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get list namespace queues: %v;", err)
+		}
+		return len(childQueues), nil
+	}
+
+	childQueues, err := config.GetQueuesByParent(queueRef.Name)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get list queues: %v;", err)
+	}
+	return len(childQueues), nil
+}
+
+func jobQueueDisplayName(queueRef *queueutil.ResolvedReference) string {
+	if queueRef.Scope == queueutil.NamespaceQueueScope {
+		return fmt.Sprintf("%s/%s", queueRef.Namespace, queueRef.Name)
+	}
+	return queueRef.Name
 }
 
 func validateJobUpdate(old, new *v1alpha1.Job) error {
