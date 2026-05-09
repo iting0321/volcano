@@ -2185,6 +2185,22 @@ func setupQueueInformerWithIndex(factory informers.SharedInformerFactory) cache.
 	return queueInformer
 }
 
+func setupNamespaceQueueInformerWithIndex(factory informers.SharedInformerFactory) cache.SharedIndexInformer {
+	namespaceQueueInformer := factory.InformerFor(&schedulingv1beta1.NamespaceQueue{},
+		func(c volcanoversioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+			return schedulingv1beta1informers.NewNamespaceQueueInformer(
+				c,
+				metav1.NamespaceAll,
+				resyncPeriod,
+				cache.Indexers{
+					cache.NamespaceIndex:                 cache.MetaNamespaceIndexFunc,
+					router.NamespaceQueueParentIndexName: router.NamespaceQueueParentIndexFunc,
+				},
+			)
+		})
+	return namespaceQueueInformer
+}
+
 func TestValidateQueueDepthDynamic(t *testing.T) {
 	// Setup fake client and lister
 	config.VolcanoClient = fakeclient.NewSimpleClientset()
@@ -2249,6 +2265,105 @@ func TestValidateQueueDepthDynamic(t *testing.T) {
 				t.Errorf("expected error: %v, got: %v", test.expectedError, err)
 			}
 		})
+	}
+}
+
+func TestValidateNamespaceQueueDepthDynamic(t *testing.T) {
+	config.VolcanoClient = fakeclient.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(config.VolcanoClient, 0)
+	namespaceQueueInformer := setupNamespaceQueueInformerWithIndex(informerFactory)
+	config.NamespaceQueueInformer = namespaceQueueInformer
+	config.NamespaceQueueLister = informerFactory.Scheduling().V1beta1().NamespaceQueues().Lister()
+
+	namespace := "tenant-a"
+	q1 := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "q1", Namespace: namespace},
+		Spec:       schedulingv1beta1.QueueSpec{},
+	}
+	q2 := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "q2", Namespace: namespace},
+		Spec:       schedulingv1beta1.QueueSpec{Parent: "q1"},
+	}
+	q3 := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "q3", Namespace: namespace},
+		Spec:       schedulingv1beta1.QueueSpec{Parent: "q2"},
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	informerFactory.Start(stopCh)
+
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), q1, metav1.CreateOptions{})
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), q2, metav1.CreateOptions{})
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), q3, metav1.CreateOptions{})
+	informerFactory.WaitForCacheSync(stopCh)
+
+	tests := []struct {
+		name          string
+		maxDepth      int
+		queue         *schedulingv1beta1.NamespaceQueue
+		expectedError bool
+	}{
+		{
+			name:          "Depth 3 is allowed when maxDepth is 5",
+			maxDepth:      5,
+			queue:         q3,
+			expectedError: false,
+		},
+		{
+			name:          "Depth 3 is allowed when maxDepth is 3",
+			maxDepth:      3,
+			queue:         q3,
+			expectedError: false,
+		},
+		{
+			name:          "Depth 3 is rejected when maxDepth is 2",
+			maxDepth:      2,
+			queue:         q3,
+			expectedError: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config.MaxQueueDepth = test.maxDepth
+			err := validateNamespaceQueueDepth(test.queue)
+			if (err != nil) != test.expectedError {
+				t.Errorf("expected error: %v, got: %v", test.expectedError, err)
+			}
+		})
+	}
+}
+
+func TestValidateNamespaceQueueParentRejectsCycle(t *testing.T) {
+	config.VolcanoClient = fakeclient.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(config.VolcanoClient, 0)
+	namespaceQueueInformer := setupNamespaceQueueInformerWithIndex(informerFactory)
+	config.NamespaceQueueInformer = namespaceQueueInformer
+	config.NamespaceQueueLister = informerFactory.Scheduling().V1beta1().NamespaceQueues().Lister()
+	config.MaxQueueDepth = 5
+
+	namespace := "tenant-a"
+	a := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: namespace},
+		Spec:       schedulingv1beta1.QueueSpec{Parent: "b"},
+	}
+	b := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: namespace},
+		Spec:       schedulingv1beta1.QueueSpec{Parent: "a"},
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	informerFactory.Start(stopCh)
+
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), a, metav1.CreateOptions{})
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), b, metav1.CreateOptions{})
+	informerFactory.WaitForCacheSync(stopCh)
+
+	err := validateNamespaceQueueParent(b)
+	if err == nil {
+		t.Fatalf("expected cycle validation error, got nil")
 	}
 }
 

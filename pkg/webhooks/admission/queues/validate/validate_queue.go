@@ -789,10 +789,34 @@ func validateNamespaceQueueParent(queue *schedulingv1beta1.NamespaceQueue) error
 	if config.NamespaceQueueLister == nil {
 		return fmt.Errorf("namespace queue lister is not initialized")
 	}
-	_, err := config.NamespaceQueueLister.NamespaceQueues(queue.Namespace).Get(queue.Spec.Parent)
-	if err != nil {
-		return fmt.Errorf("failed to get parent namespace queue of queue %s/%s: %v", queue.Namespace, queue.Name, err)
+	return validateNamespaceQueueDepth(queue)
+}
+
+func validateNamespaceQueueDepth(queue *schedulingv1beta1.NamespaceQueue) error {
+	depth := 1
+	parent := queue.Spec.Parent
+	visited := map[string]struct{}{
+		queue.Name: {},
 	}
+
+	for parent != "" {
+		if _, found := visited[parent]; found {
+			return fmt.Errorf("namespace queue %s/%s creates a cycle in parent hierarchy via %s", queue.Namespace, queue.Name, parent)
+		}
+		visited[parent] = struct{}{}
+
+		depth++
+		if depth > config.MaxQueueDepth {
+			return fmt.Errorf("namespace queue %s/%s exceeds the maximum allowed depth of %d", queue.Namespace, queue.Name, config.MaxQueueDepth)
+		}
+
+		p, err := config.NamespaceQueueLister.NamespaceQueues(queue.Namespace).Get(parent)
+		if err != nil {
+			return fmt.Errorf("failed to get parent namespace queue %s of queue %s/%s: %v", parent, queue.Namespace, queue.Name, err)
+		}
+		parent = p.Spec.Parent
+	}
+
 	return nil
 }
 
