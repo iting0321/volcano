@@ -733,6 +733,98 @@ func TestSchedulerCache_NamespaceQueueV1beta1Handlers(t *testing.T) {
 
 		assert.Nil(t, cache.Queues[queueID])
 	})
+
+	t.Run("add namespace queue re-resolves existing jobs from cluster queue", func(t *testing.T) {
+		cache := &SchedulerCache{
+			Jobs:                make(map[api.JobID]*api.JobInfo),
+			Nodes:               make(map[string]*api.NodeInfo),
+			Queues:              make(map[api.QueueID]*api.QueueInfo),
+			CSINodesStatus:      make(map[string]*api.CSINodeStatusInfo),
+			HyperNodesInfo:      api.NewHyperNodesInfo(nil),
+			InUseNodesInShard:   sets.Set[string]{},
+			NamespaceCollection: make(map[string]*api.NamespaceCollection),
+		}
+		cache.upsertQueue(api.NewQueueInfo(&scheduling.Queue{
+			ObjectMeta: metav1.ObjectMeta{Name: queueName},
+		}))
+
+		pg := &api.PodGroup{
+			PodGroup: scheduling.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "job-1",
+					Namespace: namespace,
+				},
+				Spec: scheduling.PodGroupSpec{
+					Queue: queueName,
+				},
+			},
+		}
+
+		err := cache.setPodGroup(pg)
+		assert.NoError(t, err)
+
+		jobID := api.JobID(fmt.Sprintf("%s/%s", namespace, pg.Name))
+		assert.Equal(t, api.QueueID(queueutil.ClusterKey(queueName)), cache.Jobs[jobID].Queue)
+
+		cache.AddNamespaceQueueV1beta1(&schedulingv1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      queueName,
+				Namespace: namespace,
+			},
+		})
+
+		assert.Equal(t, api.QueueID(queueutil.NamespaceKey(namespace, queueName)), cache.Jobs[jobID].Queue)
+	})
+
+	t.Run("delete namespace queue re-resolves existing jobs to cluster queue and keeps snapshot visible", func(t *testing.T) {
+		cache := &SchedulerCache{
+			Jobs:                make(map[api.JobID]*api.JobInfo),
+			Nodes:               make(map[string]*api.NodeInfo),
+			Queues:              make(map[api.QueueID]*api.QueueInfo),
+			CSINodesStatus:      make(map[string]*api.CSINodeStatusInfo),
+			HyperNodesInfo:      api.NewHyperNodesInfo(nil),
+			InUseNodesInShard:   sets.Set[string]{},
+			NamespaceCollection: make(map[string]*api.NamespaceCollection),
+		}
+		cache.upsertQueue(api.NewQueueInfo(&scheduling.Queue{
+			ObjectMeta: metav1.ObjectMeta{Name: queueName},
+		}))
+
+		namespaceQueue := &schedulingv1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      queueName,
+				Namespace: namespace,
+			},
+		}
+		cache.AddNamespaceQueueV1beta1(namespaceQueue)
+
+		pg := &api.PodGroup{
+			PodGroup: scheduling.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "job-2",
+					Namespace: namespace,
+				},
+				Spec: scheduling.PodGroupSpec{
+					Queue: queueName,
+				},
+			},
+		}
+
+		err := cache.setPodGroup(pg)
+		assert.NoError(t, err)
+
+		jobID := api.JobID(fmt.Sprintf("%s/%s", namespace, pg.Name))
+		assert.Equal(t, api.QueueID(queueutil.NamespaceKey(namespace, queueName)), cache.Jobs[jobID].Queue)
+
+		cache.DeleteNamespaceQueueV1beta1(namespaceQueue)
+
+		assert.Equal(t, api.QueueID(queueutil.ClusterKey(queueName)), cache.Jobs[jobID].Queue)
+
+		snapshot := cache.Snapshot()
+		if _, found := snapshot.Jobs[jobID]; !found {
+			t.Fatalf("expected job %s to remain visible after namespace queue deletion fallback", jobID)
+		}
+	})
 }
 
 func TestSchedulerCache_SyncNode(t *testing.T) {
