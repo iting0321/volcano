@@ -31,6 +31,7 @@ import (
 	"volcano.sh/apis/pkg/apis/scheduling"
 	schedulingv1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/util"
@@ -644,6 +645,94 @@ func TestSchedulerCache_DeleteQueueV1beta1(t *testing.T) {
 			t.Errorf("Expected: %v but got: %v in case %d", test.Expected, queue.Queue, i)
 		}
 	}
+}
+
+func TestSchedulerCache_NamespaceQueueV1beta1Handlers(t *testing.T) {
+	namespace := "test"
+	queueName := "q1"
+	queueID := api.QueueID(queueutil.NamespaceKey(namespace, queueName))
+
+	t.Run("add namespace queue", func(t *testing.T) {
+		cache := &SchedulerCache{
+			Jobs:   make(map[api.JobID]*api.JobInfo),
+			Nodes:  make(map[string]*api.NodeInfo),
+			Queues: make(map[api.QueueID]*api.QueueInfo),
+		}
+
+		cache.AddNamespaceQueueV1beta1(&schedulingv1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      queueName,
+				Namespace: namespace,
+			},
+		})
+
+		queue := cache.Queues[queueID]
+		if queue == nil {
+			t.Fatalf("expected namespace queue %s to be added", queueID)
+		}
+		assert.Equal(t, queueutil.NamespaceQueueScope, queue.Scope)
+		assert.Equal(t, namespace, queue.Namespace)
+		assert.Equal(t, queueName, queue.SourceName)
+		assert.NotNil(t, queue.NamespaceQueue)
+		assert.Equal(t, queueutil.NamespaceKey(namespace, queueName), queue.Queue.Name)
+	})
+
+	t.Run("update namespace queue", func(t *testing.T) {
+		cache := &SchedulerCache{
+			Jobs:   make(map[api.JobID]*api.JobInfo),
+			Nodes:  make(map[string]*api.NodeInfo),
+			Queues: make(map[api.QueueID]*api.QueueInfo),
+		}
+
+		cache.UpdateNamespaceQueueV1beta1(
+			&schedulingv1.NamespaceQueue{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            queueName,
+					Namespace:       namespace,
+					ResourceVersion: "1",
+				},
+				Spec: schedulingv1.QueueSpec{
+					Weight: 1,
+				},
+			},
+			&schedulingv1.NamespaceQueue{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            queueName,
+					Namespace:       namespace,
+					ResourceVersion: "2",
+				},
+				Spec: schedulingv1.QueueSpec{
+					Weight: 9,
+				},
+			},
+		)
+
+		queue := cache.Queues[queueID]
+		if queue == nil {
+			t.Fatalf("expected namespace queue %s to be updated", queueID)
+		}
+		assert.Equal(t, int32(9), queue.Weight)
+		assert.Equal(t, int32(9), queue.Queue.Spec.Weight)
+	})
+
+	t.Run("delete namespace queue", func(t *testing.T) {
+		cache := &SchedulerCache{
+			Jobs:   make(map[api.JobID]*api.JobInfo),
+			Nodes:  make(map[string]*api.NodeInfo),
+			Queues: make(map[api.QueueID]*api.QueueInfo),
+		}
+
+		queue := &schedulingv1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      queueName,
+				Namespace: namespace,
+			},
+		}
+		cache.AddNamespaceQueueV1beta1(queue)
+		cache.DeleteNamespaceQueueV1beta1(queue)
+
+		assert.Nil(t, cache.Queues[queueID])
+	})
 }
 
 func TestSchedulerCache_SyncNode(t *testing.T) {

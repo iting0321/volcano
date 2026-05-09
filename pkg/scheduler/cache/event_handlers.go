@@ -933,9 +933,9 @@ func (sc *SchedulerCache) AddQueueV1beta1(obj interface{}) {
 		return
 	}
 
-	queue := &scheduling.Queue{}
-	if err := scheme.Scheme.Convert(ss, queue, nil); err != nil {
-		klog.Errorf("Failed to convert queue from %T to %T", ss, queue)
+	qi, err := buildClusterQueueInfo(ss)
+	if err != nil {
+		klog.Errorf("Failed to convert queue from %T to queue info: %v", ss, err)
 		return
 	}
 
@@ -943,7 +943,7 @@ func (sc *SchedulerCache) AddQueueV1beta1(obj interface{}) {
 	defer sc.Mutex.Unlock()
 
 	klog.V(4).Infof("Add Queue(%s) into cache, spec(%#v)", ss.Name, ss.Spec)
-	sc.addQueue(queue)
+	sc.upsertQueue(qi)
 }
 
 // AddNamespaceQueueV1beta1 add namespace queue to scheduler cache
@@ -954,11 +954,13 @@ func (sc *SchedulerCache) AddNamespaceQueueV1beta1(obj interface{}) {
 		return
 	}
 
+	qi := buildNamespaceQueueInfo(ss)
+
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
 
 	klog.V(4).Infof("Add NamespaceQueue(%s/%s) into cache, spec(%#v)", ss.Namespace, ss.Name, ss.Spec)
-	sc.addNamespaceQueue(ss)
+	sc.upsertQueue(qi)
 }
 
 // UpdateQueueV1beta1 update queue to scheduler cache
@@ -978,15 +980,15 @@ func (sc *SchedulerCache) UpdateQueueV1beta1(oldObj, newObj interface{}) {
 		return
 	}
 
-	newQueue := &scheduling.Queue{}
-	if err := scheme.Scheme.Convert(newSS, newQueue, nil); err != nil {
-		klog.Errorf("Failed to convert queue from %T to %T", newSS, newQueue)
+	qi, err := buildClusterQueueInfo(newSS)
+	if err != nil {
+		klog.Errorf("Failed to convert queue from %T to queue info: %v", newSS, err)
 		return
 	}
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
-	sc.updateQueue(newQueue)
+	sc.upsertQueue(qi)
 }
 
 // UpdateNamespaceQueueV1beta1 updates namespace queue in scheduler cache.
@@ -1005,9 +1007,11 @@ func (sc *SchedulerCache) UpdateNamespaceQueueV1beta1(oldObj, newObj interface{}
 		return
 	}
 
+	qi := buildNamespaceQueueInfo(newSS)
+
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
-	sc.addNamespaceQueue(newSS)
+	sc.upsertQueue(qi)
 }
 
 // DeleteQueueV1beta1 delete queue from the scheduler cache
@@ -1030,7 +1034,7 @@ func (sc *SchedulerCache) DeleteQueueV1beta1(obj interface{}) {
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
-	sc.deleteQueue(schedulingapi.QueueID(queueutil.ClusterKey(ss.Name)))
+	sc.deleteQueueByID(schedulingapi.QueueID(queueutil.ClusterKey(ss.Name)))
 }
 
 // DeleteNamespaceQueueV1beta1 delete namespace queue from scheduler cache.
@@ -1053,28 +1057,42 @@ func (sc *SchedulerCache) DeleteNamespaceQueueV1beta1(obj interface{}) {
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
-	sc.deleteQueue(schedulingapi.QueueID(queueutil.NamespaceKey(ss.Namespace, ss.Name)))
+	sc.deleteQueueByID(schedulingapi.QueueID(queueutil.NamespaceKey(ss.Namespace, ss.Name)))
 }
 
 func (sc *SchedulerCache) addQueue(queue *scheduling.Queue) {
-	qi := schedulingapi.NewQueueInfo(queue)
-	sc.Queues[qi.UID] = qi
+	sc.upsertQueue(schedulingapi.NewQueueInfo(queue))
 }
 
 func (sc *SchedulerCache) addNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) {
-	qi := schedulingapi.NewNamespaceQueueInfo(queue)
-	sc.Queues[qi.UID] = qi
+	sc.upsertQueue(schedulingapi.NewNamespaceQueueInfo(queue))
 }
 
 func (sc *SchedulerCache) updateQueue(queue *scheduling.Queue) {
 	sc.addQueue(queue)
 }
 
-func (sc *SchedulerCache) deleteQueue(id schedulingapi.QueueID) {
+func (sc *SchedulerCache) upsertQueue(queueInfo *schedulingapi.QueueInfo) {
+	sc.Queues[queueInfo.UID] = queueInfo
+}
+
+func (sc *SchedulerCache) deleteQueueByID(id schedulingapi.QueueID) {
 	if queue, ok := sc.Queues[id]; ok {
 		delete(sc.Queues, id)
 		metrics.DeleteQueueMetrics(queue.Name)
 	}
+}
+
+func buildClusterQueueInfo(queue *schedulingv1beta1.Queue) (*schedulingapi.QueueInfo, error) {
+	effective := &scheduling.Queue{}
+	if err := scheme.Scheme.Convert(queue, effective, nil); err != nil {
+		return nil, err
+	}
+	return schedulingapi.NewQueueInfo(effective), nil
+}
+
+func buildNamespaceQueueInfo(queue *schedulingv1beta1.NamespaceQueue) *schedulingapi.QueueInfo {
+	return schedulingapi.NewNamespaceQueueInfo(queue)
 }
 
 // DeletePriorityClass delete priorityclass from the scheduler cache
