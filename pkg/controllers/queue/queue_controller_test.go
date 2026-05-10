@@ -53,6 +53,24 @@ func newFakeController() *queuecontroller {
 	return controller
 }
 
+func addNamespaceQueue(t *testing.T, c *queuecontroller, queue *schedulingv1beta1.NamespaceQueue) {
+	t.Helper()
+
+	_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).Create(context.TODO(), queue, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	err = c.namespaceQueueInformer.Informer().GetStore().Add(queue.DeepCopy())
+	assert.NoError(t, err)
+}
+
+func addClusterQueue(t *testing.T, c *queuecontroller, queue *schedulingv1beta1.Queue) {
+	t.Helper()
+
+	_, err := c.vcClient.SchedulingV1beta1().Queues().Create(context.TODO(), queue, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	err = c.queueInformer.Informer().GetStore().Add(queue.DeepCopy())
+	assert.NoError(t, err)
+}
+
 func TestAddQueue(t *testing.T) {
 	testCases := []struct {
 		Name        string
@@ -293,11 +311,10 @@ func TestSyncQueue(t *testing.T) {
 	for _, testcase := range testCases {
 		c := newFakeController()
 
-		_, err := c.vcClient.SchedulingV1beta1().Queues().Create(context.TODO(), testcase.queue, metav1.CreateOptions{})
-		assert.NoError(t, err)
+		addClusterQueue(t, c, testcase.queue)
 
 		updateStatusFn := testcase.updateStatusFnFactory(testcase.queue)
-		err = c.syncQueue(testcase.queue, updateStatusFn)
+		err := c.syncQueue(testcase.queue, updateStatusFn)
 		assert.NoError(t, err)
 
 		item, err := c.vcClient.SchedulingV1beta1().Queues().Get(context.TODO(), testcase.queue.Name, metav1.GetOptions{})
@@ -365,8 +382,7 @@ func TestNamespaceQueueStateTransitions(t *testing.T) {
 	for _, testcase := range testCases {
 		c := newFakeController()
 
-		_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(testcase.queue.Namespace).Create(context.TODO(), testcase.queue, metav1.CreateOptions{})
-		assert.NoError(t, err)
+		addNamespaceQueue(t, c, testcase.queue)
 
 		queueKey := queueutil.NamespaceKey(testcase.queue.Namespace, testcase.queue.Name)
 		c.podGroups[queueKey] = make(map[string]struct{}, len(testcase.podGroups))
@@ -374,13 +390,166 @@ func TestNamespaceQueueStateTransitions(t *testing.T) {
 			c.podGroups[queueKey][pgKey] = struct{}{}
 		}
 
-		err = testcase.action(c, testcase.queue)
+		err := testcase.action(c, testcase.queue)
 		assert.NoError(t, err)
 
 		item, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(testcase.queue.Namespace).Get(context.TODO(), testcase.queue.Name, metav1.GetOptions{})
 		assert.NoError(t, err)
 		assert.Equal(t, testcase.expectedState, item.Status.State)
 	}
+}
+
+func TestNamespaceQueueHierarchy(t *testing.T) {
+	t.Run("open child blocked by closed parent", func(t *testing.T) {
+		c := newFakeController()
+		parent := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateClosed,
+			},
+		}
+		child := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "child",
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				Parent: "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateClosed,
+			},
+		}
+
+		addNamespaceQueue(t, c, parent)
+		addNamespaceQueue(t, c, child)
+
+		err := c.openNamespaceQueue(child)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Open the parent queue first")
+	})
+
+	t.Run("close parent cascades child close request", func(t *testing.T) {
+		c := newFakeController()
+		parent := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateOpen,
+			},
+		}
+		child := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "child",
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				Parent: "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateOpen,
+			},
+		}
+
+		addNamespaceQueue(t, c, parent)
+		addNamespaceQueue(t, c, child)
+
+		err := c.closeNamespaceQueue(parent)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, c.queue.Len())
+
+		req, shutdown := c.queue.Get()
+		assert.False(t, shutdown)
+		assert.Equal(t, queueutil.NamespaceKey("ns1", "child"), req.QueueName)
+		assert.Equal(t, "CloseQueue", string(req.Action))
+		c.queue.Done(req)
+
+		item, err := c.vcClient.SchedulingV1beta1().NamespaceQueues("ns1").Get(context.TODO(), "child", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, ClosedByParentAnnotationTrueValue, item.Annotations[ClosedByParentAnnotationKey])
+	})
+
+	t.Run("sync child enqueues close when parent is closed", func(t *testing.T) {
+		c := newFakeController()
+		parent := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateClosed,
+			},
+		}
+		child := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "child",
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				Parent: "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateOpen,
+			},
+		}
+
+		addNamespaceQueue(t, c, parent)
+		addNamespaceQueue(t, c, child)
+
+		err := c.syncNamespaceQueue(child)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, c.queue.Len())
+
+		req, shutdown := c.queue.Get()
+		assert.False(t, shutdown)
+		assert.Equal(t, queueutil.NamespaceKey("ns1", "child"), req.QueueName)
+		assert.Equal(t, "CloseQueue", string(req.Action))
+		c.queue.Done(req)
+	})
+
+	t.Run("sync child enqueues reopen when parent reopens", func(t *testing.T) {
+		c := newFakeController()
+		parent := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateOpen,
+			},
+		}
+		child := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "ns1",
+				Name:        "child",
+				Annotations: map[string]string{ClosedByParentAnnotationKey: ClosedByParentAnnotationTrueValue},
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				Parent: "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateClosed,
+			},
+		}
+
+		addNamespaceQueue(t, c, parent)
+		addNamespaceQueue(t, c, child)
+
+		err := c.syncNamespaceQueue(child)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, c.queue.Len())
+
+		req, shutdown := c.queue.Get()
+		assert.False(t, shutdown)
+		assert.Equal(t, queueutil.NamespaceKey("ns1", "child"), req.QueueName)
+		assert.Equal(t, "OpenQueue", string(req.Action))
+		c.queue.Done(req)
+	})
 }
 
 func TestProcessNextWorkItem(t *testing.T) {

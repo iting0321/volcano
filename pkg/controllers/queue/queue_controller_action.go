@@ -328,7 +328,7 @@ func (c *queuecontroller) handleNamespaceQueue(req *apis.Request, queue *schedul
 }
 
 func (c *queuecontroller) syncNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
-	return c.syncQueueStatus(&queueStatusAdapterFuncs{
+	if err := c.syncQueueStatus(&queueStatusAdapterFuncs{
 		queueKey: queueutil.NamespaceKey(queue.Namespace, queue.Name),
 		getStatus: func() *schedulingv1beta1.QueueStatus {
 			return queue.Status.DeepCopy()
@@ -364,10 +364,21 @@ func (c *queuecontroller) syncNamespaceQueue(queue *schedulingv1beta1.NamespaceQ
 			_, err := c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).UpdateStatus(context.TODO(), newQueue, metav1.UpdateOptions{})
 			return err
 		},
-	})
+	}); err != nil {
+		return err
+	}
+
+	return c.syncHierarchicalNamespaceQueue(queue)
 }
 
 func (c *queuecontroller) openNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	if queue.Status.State != schedulingv1beta1.QueueStateOpen {
+		err := c.openHierarchicalNamespaceQueue(queue)
+		if err != nil {
+			return err
+		}
+	}
+
 	return c.openQueueStatus(&queueStatusAdapterFuncs{
 		queueKey: queueutil.NamespaceKey(queue.Namespace, queue.Name),
 		getStatus: func() *schedulingv1beta1.QueueStatus {
@@ -390,6 +401,13 @@ func (c *queuecontroller) openNamespaceQueue(queue *schedulingv1beta1.NamespaceQ
 }
 
 func (c *queuecontroller) closeNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	if queue.Status.State != schedulingv1beta1.QueueStateClosed && queue.Status.State != schedulingv1beta1.QueueStateClosing {
+		continued, err := c.closeHierarchicalNamespaceQueue(queue)
+		if !continued {
+			return err
+		}
+	}
+
 	return c.closeQueueStatus(&queueStatusAdapterFuncs{
 		queueKey: queueutil.NamespaceKey(queue.Namespace, queue.Name),
 		getStatus: func() *schedulingv1beta1.QueueStatus {
@@ -465,6 +483,51 @@ func (c *queuecontroller) syncHierarchicalQueue(queue *schedulingv1beta1.Queue) 
 	return nil
 }
 
+func (c *queuecontroller) syncHierarchicalNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	if queue.Name == "root" || queue.Spec.Parent == "" || queue.Spec.Parent == "root" {
+		return nil
+	}
+
+	parentQueue, err := c.namespaceQueueLister.NamespaceQueues(queue.Namespace).Get(queue.Spec.Parent)
+	if err != nil {
+		klog.Errorf("Failed to get parent queue of NamespaceQueue %s/%s: %v.", queue.Namespace, queue.Name, err)
+		return err
+	}
+
+	switch parentQueue.Status.State {
+	case schedulingv1beta1.QueueStateClosed, schedulingv1beta1.QueueStateClosing:
+		if queue.Status.State != schedulingv1beta1.QueueStateClosed && queue.Status.State != schedulingv1beta1.QueueStateClosing {
+			_, err = c.updateNamespaceQueueAnnotation(queue, ClosedByParentAnnotationKey, ClosedByParentAnnotationTrueValue)
+			if err != nil {
+				klog.Errorf("Failed to patch annotation of NamespaceQueue %s/%s: %v.", queue.Namespace, queue.Name, err)
+				return err
+			}
+
+			req := &apis.Request{
+				QueueName: queueutil.NamespaceKey(queue.Namespace, queue.Name),
+				Action:    busv1alpha1.CloseQueueAction,
+			}
+
+			c.enqueue(req)
+			klog.V(3).Infof("Closing namespace queue %s/%s because its parent queue %s is closing or closed.", queue.Namespace, queue.Name, parentQueue.Name)
+		}
+	case schedulingv1beta1.QueueStateOpen:
+		if queue.Status.State == schedulingv1beta1.QueueStateClosed || queue.Status.State == schedulingv1beta1.QueueStateClosing {
+			if queue.Annotations[ClosedByParentAnnotationKey] == ClosedByParentAnnotationTrueValue {
+				req := &apis.Request{
+					QueueName: queueutil.NamespaceKey(queue.Namespace, queue.Name),
+					Action:    busv1alpha1.OpenQueueAction,
+				}
+
+				c.enqueue(req)
+				klog.V(3).Infof("Opening namespace queue %s/%s because its parent queue %s is opened.", queue.Namespace, queue.Name, parentQueue.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
 func (c *queuecontroller) openHierarchicalQueue(queue *schedulingv1beta1.Queue) error {
 	if queue.Spec.Parent != "" && queue.Spec.Parent != "root" {
 		parentQueue, err := c.queueLister.Get(queue.Spec.Parent)
@@ -491,6 +554,36 @@ func (c *queuecontroller) openHierarchicalQueue(queue *schedulingv1beta1.Queue) 
 
 			c.enqueue(req)
 			klog.Infof("Opening queue %s because its parent queue %s is opened", childQueue.Name, queue.Name)
+		}
+	}
+	return nil
+}
+
+func (c *queuecontroller) openHierarchicalNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	if queue.Spec.Parent != "" && queue.Spec.Parent != "root" {
+		parentQueue, err := c.namespaceQueueLister.NamespaceQueues(queue.Namespace).Get(queue.Spec.Parent)
+		if err != nil {
+			return fmt.Errorf("failed to get parent queue %s of namespace queue %s/%s: %v", queue.Spec.Parent, queue.Namespace, queue.Name, err)
+		}
+		if parentQueue.Status.State == schedulingv1beta1.QueueStateClosing || parentQueue.Status.State == schedulingv1beta1.QueueStateClosed {
+			return fmt.Errorf("failed to open namespace queue %s/%s because its parent queue %s is closing or closed. Open the parent queue first", queue.Namespace, queue.Name, queue.Spec.Parent)
+		}
+	}
+
+	queueList, err := c.namespaceQueueLister.NamespaceQueues(queue.Namespace).List(labels.Everything())
+	if err != nil {
+		return err
+	}
+
+	for _, childQueue := range queueList {
+		if childQueue.Spec.Parent == queue.Name && len(childQueue.Annotations) > 0 && childQueue.Annotations[ClosedByParentAnnotationKey] == ClosedByParentAnnotationTrueValue {
+			req := &apis.Request{
+				QueueName: queueutil.NamespaceKey(childQueue.Namespace, childQueue.Name),
+				Action:    busv1alpha1.OpenQueueAction,
+			}
+
+			c.enqueue(req)
+			klog.Infof("Opening namespace queue %s/%s because its parent queue %s/%s is opened", childQueue.Namespace, childQueue.Name, queue.Namespace, queue.Name)
 		}
 	}
 	return nil
@@ -523,6 +616,39 @@ func (c *queuecontroller) closeHierarchicalQueue(queue *schedulingv1beta1.Queue)
 
 			c.enqueue(req)
 			klog.V(3).Infof("Closing child queue %s because its parent queue %s is closing or closed.", childQueue.Name, queue.Name)
+		}
+	}
+
+	return true, nil
+}
+
+func (c *queuecontroller) closeHierarchicalNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) (bool, error) {
+	if queue.Name == "root" {
+		klog.Errorf("Root namespace queue cannot be closed")
+		return false, nil
+	}
+
+	queueList, err := c.namespaceQueueLister.NamespaceQueues(queue.Namespace).List(labels.Everything())
+	if err != nil {
+		return false, err
+	}
+
+	for _, childQueue := range queueList {
+		if childQueue.Spec.Parent != queue.Name {
+			continue
+		}
+		if childQueue.Status.State != schedulingv1beta1.QueueStateClosed && childQueue.Status.State != schedulingv1beta1.QueueStateClosing {
+			_, err = c.updateNamespaceQueueAnnotation(childQueue, ClosedByParentAnnotationKey, ClosedByParentAnnotationTrueValue)
+			if err != nil {
+				return false, fmt.Errorf("failed to update annotations of namespace queue %s/%s: %v", childQueue.Namespace, childQueue.Name, err)
+			}
+			req := &apis.Request{
+				QueueName: queueutil.NamespaceKey(childQueue.Namespace, childQueue.Name),
+				Action:    busv1alpha1.CloseQueueAction,
+			}
+
+			c.enqueue(req)
+			klog.V(3).Infof("Closing child namespace queue %s/%s because its parent queue %s/%s is closing or closed.", childQueue.Namespace, childQueue.Name, queue.Namespace, queue.Name)
 		}
 	}
 
@@ -578,4 +704,34 @@ func (c *queuecontroller) updateQueueAnnotation(queue *schedulingv1beta1.Queue, 
 	}
 
 	return c.vcClient.SchedulingV1beta1().Queues().Patch(context.TODO(), queue.Name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
+}
+
+func (c *queuecontroller) updateNamespaceQueueAnnotation(queue *schedulingv1beta1.NamespaceQueue, key string, value string) (*schedulingv1beta1.NamespaceQueue, error) {
+	if len(queue.Annotations) > 0 && queue.Annotations[key] == value {
+		return queue, nil
+	}
+
+	var patch []patchOperation
+	if len(queue.Annotations) == 0 {
+		patch = append(patch, patchOperation{
+			Op:   "replace",
+			Path: "/metadata/annotations",
+			Value: map[string]string{
+				key: value,
+			},
+		})
+	} else {
+		patch = append(patch, patchOperation{
+			Op:    "replace",
+			Path:  fmt.Sprintf("/metadata/annotations/%s", strings.ReplaceAll(key, "/", "~1")),
+			Value: value,
+		})
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.vcClient.SchedulingV1beta1().NamespaceQueues(queue.Namespace).Patch(context.TODO(), queue.Name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
 }
