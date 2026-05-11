@@ -379,7 +379,7 @@ func (c *queuecontroller) openNamespaceQueue(queue *schedulingv1beta1.NamespaceQ
 		}
 	}
 
-	return c.openQueueStatus(&queueStatusAdapterFuncs{
+	err := c.openQueueStatus(&queueStatusAdapterFuncs{
 		queueKey: queueutil.NamespaceKey(queue.Namespace, queue.Name),
 		getStatus: func() *schedulingv1beta1.QueueStatus {
 			return queue.Status.DeepCopy()
@@ -398,6 +398,12 @@ func (c *queuecontroller) openNamespaceQueue(queue *schedulingv1beta1.NamespaceQ
 			return err
 		},
 	})
+	if err != nil {
+		return err
+	}
+
+	_, err = c.updateNamespaceQueueAnnotation(queue, ClosedByParentAnnotationKey, ClosedByParentAnnotationFalseValue)
+	return err
 }
 
 func (c *queuecontroller) closeNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {

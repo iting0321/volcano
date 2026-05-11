@@ -550,6 +550,43 @@ func TestNamespaceQueueHierarchy(t *testing.T) {
 		assert.Equal(t, "OpenQueue", string(req.Action))
 		c.queue.Done(req)
 	})
+
+	t.Run("open child clears closed-by-parent annotation", func(t *testing.T) {
+		c := newFakeController()
+		parent := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateOpen,
+			},
+		}
+		child := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "ns1",
+				Name:        "child",
+				Annotations: map[string]string{ClosedByParentAnnotationKey: ClosedByParentAnnotationTrueValue},
+			},
+			Spec: schedulingv1beta1.QueueSpec{
+				Parent: "parent",
+			},
+			Status: schedulingv1beta1.QueueStatus{
+				State: schedulingv1beta1.QueueStateClosed,
+			},
+		}
+
+		addNamespaceQueue(t, c, parent)
+		addNamespaceQueue(t, c, child)
+
+		err := c.openNamespaceQueue(child)
+		assert.NoError(t, err)
+
+		item, err := c.vcClient.SchedulingV1beta1().NamespaceQueues("ns1").Get(context.TODO(), "child", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, schedulingv1beta1.QueueStateOpen, item.Status.State)
+		assert.Equal(t, ClosedByParentAnnotationFalseValue, item.Annotations[ClosedByParentAnnotationKey])
+	})
 }
 
 func TestProcessNextWorkItem(t *testing.T) {
