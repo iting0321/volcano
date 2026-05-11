@@ -11283,7 +11283,7 @@ spec:
       - operations: ["CREATE", "UPDATE", "DELETE"]
         apiGroups: ["scheduling.volcano.sh"]
         apiVersions: ["v1beta1"]
-        resources: ["queues"]
+        resources: ["queues", "namespacequeues"]
   variables:
     # Extract hierarchy annotation if present
     - name: hierarchyPath
@@ -11842,7 +11842,7 @@ spec:
     - operations: ["CREATE"]
       apiGroups: ["scheduling.volcano.sh"]
       apiVersions: ["v1beta1"]
-      resources: ["queues"]
+      resources: ["queues", "namespacequeues"]
   mutations:
   # Add root prefix to hierarchy annotation if hierarchy is specified but doesn't start with "root"
   - patchType: JSONPatch
@@ -12062,7 +12062,7 @@ spec:
     - operations: ["CREATE"]
       apiGroups: ["scheduling.volcano.sh"]
       apiVersions: ["v1beta1"] 
-      resources: ["queues"]
+      resources: ["queues", "namespacequeues"]
 ---
 # Source: volcano/templates/mutating_admission_policy.yaml
 apiVersion: admissionregistration.k8s.io/v1beta1

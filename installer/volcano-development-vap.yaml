@@ -11283,7 +11283,7 @@ spec:
       - operations: ["CREATE", "UPDATE", "DELETE"]
         apiGroups: ["scheduling.volcano.sh"]
         apiVersions: ["v1beta1"]
-        resources: ["queues"]
+        resources: ["queues", "namespacequeues"]
   variables:
     # Extract hierarchy annotation if present
     - name: hierarchyPath
