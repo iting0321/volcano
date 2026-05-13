@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -2365,6 +2366,173 @@ func TestValidateNamespaceQueueParentRejectsCycle(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected cycle validation error, got nil")
 	}
+}
+
+func TestAdmitNamespaceQueues(t *testing.T) {
+	config.VolcanoClient = fakeclient.NewSimpleClientset()
+	informerFactory := informers.NewSharedInformerFactory(config.VolcanoClient, 0)
+	namespaceQueueInformer := setupNamespaceQueueInformerWithIndex(informerFactory)
+	config.NamespaceQueueInformer = namespaceQueueInformer
+	config.NamespaceQueueLister = informerFactory.Scheduling().V1beta1().NamespaceQueues().Lister()
+	config.MaxQueueDepth = 5
+
+	namespace := "tenant-a"
+	parent := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "parent", Namespace: namespace},
+		Spec: schedulingv1beta1.QueueSpec{
+			Weight: 1,
+			Capability: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("8"),
+			},
+			Deserved: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("8"),
+			},
+			Guarantee: schedulingv1beta1.Guarantee{
+				Resource: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("8"),
+				},
+			},
+		},
+		Status: schedulingv1beta1.QueueStatus{State: schedulingv1beta1.QueueStateOpen},
+	}
+	sibling := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "sibling", Namespace: namespace},
+		Spec: schedulingv1beta1.QueueSpec{
+			Parent: "parent",
+			Weight: 1,
+			Deserved: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5"),
+			},
+			Guarantee: schedulingv1beta1.Guarantee{
+				Resource: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("5"),
+				},
+			},
+		},
+		Status: schedulingv1beta1.QueueStatus{State: schedulingv1beta1.QueueStateOpen},
+	}
+	closedLeaf := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "closed-leaf", Namespace: namespace},
+		Spec: schedulingv1beta1.QueueSpec{
+			Weight: 1,
+		},
+		Status: schedulingv1beta1.QueueStatus{State: schedulingv1beta1.QueueStateClosed},
+	}
+	openLeaf := &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: "open-leaf", Namespace: namespace},
+		Spec: schedulingv1beta1.QueueSpec{
+			Weight: 1,
+		},
+		Status: schedulingv1beta1.QueueStatus{State: schedulingv1beta1.QueueStateOpen},
+	}
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	informerFactory.Start(stopCh)
+
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), parent, metav1.CreateOptions{})
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), sibling, metav1.CreateOptions{})
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), closedLeaf, metav1.CreateOptions{})
+	_, _ = config.VolcanoClient.SchedulingV1beta1().NamespaceQueues(namespace).Create(context.TODO(), openLeaf, metav1.CreateOptions{})
+	informerFactory.WaitForCacheSync(stopCh)
+
+	marshalQueue := func(t *testing.T, queue *schedulingv1beta1.NamespaceQueue) []byte {
+		t.Helper()
+		raw, err := json.Marshal(queue)
+		if err != nil {
+			t.Fatalf("marshal namespace queue %s/%s failed: %v", queue.Namespace, queue.Name, err)
+		}
+		return raw
+	}
+
+	newReview := func(operation admissionv1.Operation, name string, object, oldObject []byte) admissionv1.AdmissionReview {
+		return admissionv1.AdmissionReview{
+			Request: &admissionv1.AdmissionRequest{
+				Kind: metav1.GroupVersionKind{
+					Group:   "scheduling.volcano.sh",
+					Version: "v1beta1",
+					Kind:    "NamespaceQueue",
+				},
+				Resource: metav1.GroupVersionResource{
+					Group:    "scheduling.volcano.sh",
+					Version:  "v1beta1",
+					Resource: "namespacequeues",
+				},
+				Namespace: namespace,
+				Name:      name,
+				Operation: operation,
+				Object:    runtime.RawExtension{Raw: object},
+				OldObject: runtime.RawExtension{Raw: oldObject},
+			},
+		}
+	}
+
+	t.Run("create rejects child capability above parent", func(t *testing.T) {
+		child := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{Name: "child-too-large", Namespace: namespace},
+			Spec: schedulingv1beta1.QueueSpec{
+				Parent: "parent",
+				Weight: 1,
+				Capability: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("9"),
+				},
+			},
+		}
+
+		resp := AdmitQueues(newReview(admissionv1.Create, child.Name, marshalQueue(t, child), nil))
+		if resp.Allowed {
+			t.Fatalf("expected create to be rejected")
+		}
+		if resp.Result == nil || !strings.Contains(resp.Result.Message, "exceeds its ancestor's capability") {
+			t.Fatalf("expected ancestor capability error, got %#v", resp.Result)
+		}
+	})
+
+	t.Run("update rejects sibling guarantees that exceed parent", func(t *testing.T) {
+		oldChild := &schedulingv1beta1.NamespaceQueue{
+			ObjectMeta: metav1.ObjectMeta{Name: "child-tight", Namespace: namespace},
+			Spec: schedulingv1beta1.QueueSpec{
+				Parent: "parent",
+				Weight: 1,
+				Deserved: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("3"),
+				},
+				Guarantee: schedulingv1beta1.Guarantee{
+					Resource: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("3"),
+					},
+				},
+			},
+		}
+		newChild := oldChild.DeepCopy()
+		newChild.Spec.Guarantee.Resource[v1.ResourceCPU] = resource.MustParse("4")
+		newChild.Spec.Deserved[v1.ResourceCPU] = resource.MustParse("4")
+
+		resp := AdmitQueues(newReview(admissionv1.Update, newChild.Name, marshalQueue(t, newChild), marshalQueue(t, oldChild)))
+		if resp.Allowed {
+			t.Fatalf("expected update to be rejected")
+		}
+		if resp.Result == nil || !strings.Contains(resp.Result.Message, "sum of children's guarantee") {
+			t.Fatalf("expected sibling guarantee error, got %#v", resp.Result)
+		}
+	})
+
+	t.Run("delete rejects open namespace queue", func(t *testing.T) {
+		resp := AdmitQueues(newReview(admissionv1.Delete, openLeaf.Name, nil, nil))
+		if resp.Allowed {
+			t.Fatalf("expected delete to be rejected")
+		}
+		if resp.Result == nil || !strings.Contains(resp.Result.Message, "only queue with state `Closed` can be deleted") {
+			t.Fatalf("expected closed-state delete error, got %#v", resp.Result)
+		}
+	})
+
+	t.Run("delete allows closed leaf namespace queue", func(t *testing.T) {
+		resp := AdmitQueues(newReview(admissionv1.Delete, closedLeaf.Name, nil, nil))
+		if !resp.Allowed {
+			t.Fatalf("expected delete to be allowed, got %#v", resp.Result)
+		}
+	})
 }
 
 func TestValidateChildAgainstAncestorForCapability(t *testing.T) {
