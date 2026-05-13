@@ -28,27 +28,16 @@ import (
 
 	busv1alpha1 "volcano.sh/apis/pkg/apis/bus/v1alpha1"
 	"volcano.sh/apis/pkg/apis/helpers"
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/apis/pkg/client/clientset/versioned"
+	queueutil "volcano.sh/volcano/pkg/queue"
 )
 
 func createQueueCommand(ctx context.Context, config *rest.Config, action busv1alpha1.Action) error {
 	queueClient := versioned.NewForConfigOrDie(config)
-	queue, err := queueClient.SchedulingV1beta1().Queues().Get(ctx, operateQueueFlags.Name, metav1.GetOptions{})
+	cmd, err := buildQueueCommand(ctx, queueClient, action)
 	if err != nil {
 		return err
-	}
-
-	ctrlRef := metav1.NewControllerRef(queue, helpers.V1beta1QueueKind)
-	cmd := &busv1alpha1.Command{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("%s-%s-",
-				queue.Name, strings.ToLower(string(action))),
-			OwnerReferences: []metav1.OwnerReference{
-				*ctrlRef,
-			},
-		},
-		TargetObject: ctrlRef,
-		Action:       string(action),
 	}
 
 	if _, err := queueClient.BusV1alpha1().Commands("default").Create(ctx, cmd, metav1.CreateOptions{}); err != nil {
@@ -56,4 +45,49 @@ func createQueueCommand(ctx context.Context, config *rest.Config, action busv1al
 	}
 
 	return nil
+}
+
+func buildQueueCommand(ctx context.Context, queueClient *versioned.Clientset, action busv1alpha1.Action) (*busv1alpha1.Command, error) {
+	if len(operateQueueFlags.Namespace) == 0 {
+		queue, err := queueClient.SchedulingV1beta1().Queues().Get(ctx, operateQueueFlags.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		ctrlRef := metav1.NewControllerRef(queue, helpers.V1beta1QueueKind)
+		return &busv1alpha1.Command{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: fmt.Sprintf("%s-%s-",
+					queue.Name, strings.ToLower(string(action))),
+				OwnerReferences: []metav1.OwnerReference{
+					*ctrlRef,
+				},
+			},
+			TargetObject: ctrlRef,
+			Action:       string(action),
+		}, nil
+	}
+
+	queue, err := queueClient.SchedulingV1beta1().NamespaceQueues(operateQueueFlags.Namespace).Get(ctx, operateQueueFlags.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Commands are created in the default namespace, so a NamespaceQueue owner
+	// reference would be cross-namespace and rejected by the apiserver.
+	targetRef := &metav1.OwnerReference{
+		APIVersion: schedulingv1beta1.SchemeGroupVersion.String(),
+		Kind:       helpers.V1beta1QueueKind.Kind,
+		Name:       queueutil.NamespaceKey(queue.Namespace, queue.Name),
+		UID:        queue.UID,
+	}
+
+	return &busv1alpha1.Command{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf("%s-%s-",
+				queue.Name, strings.ToLower(string(action))),
+		},
+		TargetObject: targetRef,
+		Action:       string(action),
+	}, nil
 }

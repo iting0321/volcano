@@ -44,6 +44,8 @@ type operateFlags struct {
 
 	// Name is name of queue
 	Name string
+	// Namespace scopes the operation to a NamespaceQueue when specified.
+	Namespace string
 	// Weight is weight of queue
 	Weight int32
 	// Action is operation action of queue
@@ -57,6 +59,7 @@ func InitOperateFlags(cmd *cobra.Command) {
 	util.InitFlags(cmd, &operateQueueFlags.CommonFlags)
 
 	cmd.Flags().StringVarP(&operateQueueFlags.Name, "name", "n", "", "the name of queue")
+	cmd.Flags().StringVarP(&operateQueueFlags.Namespace, "namespace", "N", "", "the namespace of namespace queue")
 	cmd.Flags().Int32VarP(&operateQueueFlags.Weight, "weight", "w", 0, "the weight of the queue")
 	cmd.Flags().StringVarP(&operateQueueFlags.Action, "action", "a", "",
 		"operate action to queue, valid actions are open, close, update")
@@ -88,8 +91,13 @@ func OperateQueue(ctx context.Context) error {
 
 		queueClient := versioned.NewForConfigOrDie(config)
 		patchBytes := []byte(fmt.Sprintf(`{"spec":{"weight":%d}}`, operateQueueFlags.Weight))
-		_, err := queueClient.SchedulingV1beta1().Queues().Patch(ctx,
-			operateQueueFlags.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+		if len(operateQueueFlags.Namespace) == 0 {
+			_, err = queueClient.SchedulingV1beta1().Queues().Patch(ctx,
+				operateQueueFlags.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+		} else {
+			_, err = queueClient.SchedulingV1beta1().NamespaceQueues(operateQueueFlags.Namespace).Patch(ctx,
+				operateQueueFlags.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
+		}
 
 		return err
 	case "":
