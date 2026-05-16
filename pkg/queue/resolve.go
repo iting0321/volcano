@@ -34,9 +34,10 @@ type ResolvedReference struct {
 	NamespaceQueue *schedulingv1beta1.NamespaceQueue
 }
 
-// AsQueue returns a queue-shaped view of the resolved reference so callers can
-// reuse the existing queue-based logic for namespace queues.
-func (r *ResolvedReference) AsQueue() *schedulingv1beta1.Queue {
+// AsPodGroupQueue returns a queue-shaped view of the resolved reference so
+// PodGroup and Job code can reuse the existing queue-based logic for
+// namespace queues.
+func (r *ResolvedReference) AsPodGroupQueue() *schedulingv1beta1.Queue {
 	if r == nil {
 		return nil
 	}
@@ -60,7 +61,7 @@ func (r *ResolvedReference) AsQueue() *schedulingv1beta1.Queue {
 }
 
 // Resolve finds a NamespaceQueue in the workload namespace first and falls back to a cluster Queue.
-func Resolve(namespace, name string, queueLister schedulinglister.QueueLister, namespaceQueueLister schedulinglister.NamespaceQueueLister) (*ResolvedReference, error) {
+func Resolve(namespace string, name string, queueLister schedulinglister.QueueLister, namespaceQueueLister schedulinglister.NamespaceQueueLister) (*ResolvedReference, error) {
 	if namespaceQueueLister != nil && namespace != "" {
 		namespaceQueue, err := namespaceQueueLister.NamespaceQueues(namespace).Get(name)
 		if err == nil {
@@ -72,7 +73,7 @@ func Resolve(namespace, name string, queueLister schedulinglister.QueueLister, n
 				NamespaceQueue: namespaceQueue,
 			}, nil
 		}
-		if err != nil && !apierrors.IsNotFound(err) {
+		if !apierrors.IsNotFound(err) {
 			return nil, err
 		}
 	}

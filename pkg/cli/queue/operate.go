@@ -54,6 +54,10 @@ type operateFlags struct {
 
 var operateQueueFlags = &operateFlags{}
 
+func (f *operateFlags) HasNamespace() bool {
+	return len(f.Namespace) != 0
+}
+
 // InitOperateFlags is used to init all flags during queue operating
 func InitOperateFlags(cmd *cobra.Command) {
 	util.InitFlags(cmd, &operateQueueFlags.CommonFlags)
@@ -91,7 +95,7 @@ func OperateQueue(ctx context.Context) error {
 
 		queueClient := versioned.NewForConfigOrDie(config)
 		patchBytes := []byte(fmt.Sprintf(`{"spec":{"weight":%d}}`, operateQueueFlags.Weight))
-		if len(operateQueueFlags.Namespace) == 0 {
+		if !operateQueueFlags.HasNamespace() {
 			_, err = queueClient.SchedulingV1beta1().Queues().Patch(ctx,
 				operateQueueFlags.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{})
 		} else {

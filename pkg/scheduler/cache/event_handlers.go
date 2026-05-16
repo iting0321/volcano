@@ -946,7 +946,7 @@ func (sc *SchedulerCache) AddNamespaceQueueV1beta1(obj interface{}) {
 		return
 	}
 
-	qi := buildNamespaceQueueInfo(ss)
+	qi := schedulingapi.NewNamespaceQueueInfo(ss)
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
@@ -1000,7 +1000,7 @@ func (sc *SchedulerCache) UpdateNamespaceQueueV1beta1(oldObj, newObj interface{}
 		return
 	}
 
-	qi := buildNamespaceQueueInfo(newSS)
+	qi := schedulingapi.NewNamespaceQueueInfo(newSS)
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
@@ -1058,14 +1058,6 @@ func (sc *SchedulerCache) addQueue(queue *scheduling.Queue) {
 	sc.upsertQueue(schedulingapi.NewQueueInfo(queue))
 }
 
-func (sc *SchedulerCache) addNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) {
-	sc.upsertQueue(schedulingapi.NewNamespaceQueueInfo(queue))
-}
-
-func (sc *SchedulerCache) updateQueue(queue *scheduling.Queue) {
-	sc.addQueue(queue)
-}
-
 func (sc *SchedulerCache) upsertQueue(queueInfo *schedulingapi.QueueInfo) {
 	sc.Queues[queueInfo.UID] = queueInfo
 }
@@ -1120,10 +1112,6 @@ func buildClusterQueueInfo(queue *schedulingv1beta1.Queue) (*schedulingapi.Queue
 		return nil, err
 	}
 	return schedulingapi.NewQueueInfo(effective), nil
-}
-
-func buildNamespaceQueueInfo(queue *schedulingv1beta1.NamespaceQueue) *schedulingapi.QueueInfo {
-	return schedulingapi.NewNamespaceQueueInfo(queue)
 }
 
 // DeletePriorityClass delete priorityclass from the scheduler cache

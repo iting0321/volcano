@@ -220,7 +220,7 @@ func validateJobCreate(job *v1alpha1.Job, reviewResponse *admissionv1.AdmissionR
 }
 
 func validateJobQueueSubmission(queueRef *queueutil.ResolvedReference) string {
-	queue := queueRef.AsQueue()
+	queue := queueRef.AsPodGroupQueue()
 	if queue == nil {
 		return fmt.Sprintf(" unable to find job queue: queue `%s` resolved to nil;", queueRef.Name)
 	}

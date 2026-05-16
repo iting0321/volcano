@@ -48,7 +48,7 @@ func createQueueCommand(ctx context.Context, config *rest.Config, action busv1al
 }
 
 func buildQueueCommand(ctx context.Context, queueClient *versioned.Clientset, action busv1alpha1.Action) (*busv1alpha1.Command, error) {
-	if len(operateQueueFlags.Namespace) == 0 {
+	if !operateQueueFlags.HasNamespace() {
 		queue, err := queueClient.SchedulingV1beta1().Queues().Get(ctx, operateQueueFlags.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, err

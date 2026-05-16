@@ -338,7 +338,7 @@ func (cc *jobcontroller) GetQueueInfo(namespace, queue string) (*scheduling.Queu
 		klog.Errorf("Failed to get queue from listers, error: %s", err.Error())
 		return nil, err
 	}
-	return queueRef.AsQueue(), nil
+	return queueRef.AsPodGroupQueue(), nil
 }
 
 func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.UpdateStatusFn) error {
