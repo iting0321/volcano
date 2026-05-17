@@ -373,7 +373,11 @@ func (su *defaultStatusUpdater) UpdatePodGroup(pg *schedulingapi.PodGroup) (*sch
 
 // UpdateQueueStatus will update the status of queue
 func (su *defaultStatusUpdater) UpdateQueueStatus(queue *schedulingapi.QueueInfo) error {
-	if queue.Scope == queueutil.NamespaceQueueScope && queue.NamespaceQueue != nil {
+	if queue.Scope == queueutil.NamespaceQueueScope {
+		if queue.NamespaceQueue == nil {
+			return fmt.Errorf("namespace queue info %q is missing backing NamespaceQueue", queue.Name)
+		}
+
 		newNamespaceQueue := queue.NamespaceQueue.DeepCopy()
 		if err := schedulingscheme.Scheme.Convert(&queue.Queue.Status, &newNamespaceQueue.Status, nil); err != nil {
 			klog.Errorf("error occurred in converting scheduling.QueueStatus to v1beta1.QueueStatus: %s", err.Error())

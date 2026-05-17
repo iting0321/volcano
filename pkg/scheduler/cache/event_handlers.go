@@ -953,7 +953,7 @@ func (sc *SchedulerCache) AddNamespaceQueueV1beta1(obj interface{}) {
 
 	klog.V(4).Infof("Add NamespaceQueue(%s/%s) into cache, spec(%#v)", ss.Namespace, ss.Name, ss.Spec)
 	sc.upsertQueue(qi)
-	sc.reResolveJobsForNamespaceQueue(ss.Namespace, ss.Name)
+	sc.resolveJobsForNamespaceQueue(ss.Namespace, ss.Name)
 }
 
 // UpdateQueueV1beta1 update queue to scheduler cache
@@ -1051,7 +1051,7 @@ func (sc *SchedulerCache) DeleteNamespaceQueueV1beta1(obj interface{}) {
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
 	sc.deleteQueueByID(schedulingapi.QueueID(queueutil.NamespaceKey(ss.Namespace, ss.Name)))
-	sc.reResolveJobsForNamespaceQueue(ss.Namespace, ss.Name)
+	sc.resolveJobsForNamespaceQueue(ss.Namespace, ss.Name)
 }
 
 func (sc *SchedulerCache) addQueue(queue *scheduling.Queue) {
@@ -1090,10 +1090,10 @@ func (sc *SchedulerCache) resolveJobQueueID(job *schedulingapi.JobInfo) scheduli
 	return schedulingapi.QueueID(queueutil.ClusterKey(queueName))
 }
 
-// reResolveJobsForNamespaceQueue updates cached jobs that reference the same
+// resolveJobsForNamespaceQueue updates cached jobs that reference the same
 // namespace/name queue target so they follow namespace-first resolution.
 // Assumes sc.Mutex is already held by the caller.
-func (sc *SchedulerCache) reResolveJobsForNamespaceQueue(namespace, queueName string) {
+func (sc *SchedulerCache) resolveJobsForNamespaceQueue(namespace, queueName string) {
 	for _, job := range sc.Jobs {
 		if job == nil || job.PodGroup == nil {
 			continue

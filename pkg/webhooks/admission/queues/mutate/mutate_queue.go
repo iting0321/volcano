@@ -92,15 +92,7 @@ func Queues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 		}
 	}
 
-	reviewResponse := admissionv1.AdmissionResponse{
-		Allowed: true,
-		Patch:   patchBytes,
-	}
-	if len(patchBytes) > 0 {
-		pt := admissionv1.PatchTypeJSONPatch
-		reviewResponse.PatchType = &pt
-	}
-	return &reviewResponse
+	return admissionResponseWithPatchBytes(patchBytes)
 }
 
 func createQueuePatch(queue *schedulingv1beta1.Queue) ([]byte, error) {
@@ -136,22 +128,7 @@ func mutateNamespaceQueues(ar admissionv1.AdmissionReview) *admissionv1.Admissio
 		return util.ToAdmissionResponse(err)
 	}
 
-	patch := appendQueueDefaultPatches(nil, queue.Spec.Reclaimable, queue.Spec.Weight)
-
-	patchBytes, err := json.Marshal(patch)
-	if err != nil {
-		return &admissionv1.AdmissionResponse{
-			Allowed: false,
-			Result:  &metav1.Status{Message: err.Error()},
-		}
-	}
-
-	reviewResponse := admissionv1.AdmissionResponse{Allowed: true, Patch: patchBytes}
-	if len(patchBytes) > 0 {
-		pt := admissionv1.PatchTypeJSONPatch
-		reviewResponse.PatchType = &pt
-	}
-	return &reviewResponse
+	return admissionResponseWithPatch(appendQueueDefaultPatches(nil, queue.Spec.Reclaimable, queue.Spec.Weight))
 }
 
 func appendQueueDefaultPatches(patch []patchOperation, reclaimable *bool, weight int32) []patchOperation {
@@ -174,4 +151,29 @@ func appendQueueDefaultPatches(patch []patchOperation, reclaimable *bool, weight
 	}
 
 	return patch
+}
+
+func admissionResponseWithPatch(patch []patchOperation) *admissionv1.AdmissionResponse {
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result:  &metav1.Status{Message: err.Error()},
+		}
+	}
+
+	return admissionResponseWithPatchBytes(patchBytes)
+}
+
+func admissionResponseWithPatchBytes(patchBytes []byte) *admissionv1.AdmissionResponse {
+	reviewResponse := admissionv1.AdmissionResponse{
+		Allowed: true,
+		Patch:   patchBytes,
+	}
+	if len(patchBytes) > 0 {
+		pt := admissionv1.PatchTypeJSONPatch
+		reviewResponse.PatchType = &pt
+	}
+
+	return &reviewResponse
 }

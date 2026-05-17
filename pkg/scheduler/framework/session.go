@@ -506,11 +506,16 @@ func updateQueueStatus(ssn *Session) {
 	for _, job := range ssn.Jobs {
 		for status, tasks := range job.TaskStatusIndex {
 			if api.AllocatedStatus(status) {
+				queueInfo, found := ssn.Queues[job.Queue]
+				if !found {
+					klog.Warningf("Skip allocated resource accounting for job <%s>: queue <%s> not found in session.", job.Name, job.Queue)
+					continue
+				}
 				for _, task := range tasks {
 					addNodeSharableDeviceUsage(ssn, task)
 					allocatedResources[job.Queue].Add(task.Resreq)
 					// recursively updates the allocated resources of parent queues
-					queue := ssn.Queues[job.Queue].Queue
+					queue := queueInfo.Queue
 					for queue.Spec.Parent != "" {
 						parentID := api.QueueID(queue.Spec.Parent)
 						parentQueue, found := ssn.Queues[parentID]
