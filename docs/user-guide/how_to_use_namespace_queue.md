@@ -1,28 +1,31 @@
-# How To Use NamespaceQueue
+# How to Use NamespaceQueue
 
-`NamespaceQueue` is a namespace-scoped queue resource for Volcano.
+`NamespaceQueue` is a namespace-scoped Volcano queue. It lets tenants manage queue capacity and hierarchy inside their own namespace without cluster-wide `Queue` permissions.
 
-It allows tenants to manage queue configuration inside their own namespace without requiring cluster-wide permission on `Queue`.
+`NamespaceQueue` uses the same queue fields as `Queue`, including `weight`, `capability`, `deserved`, `guarantee`, `priority`, `reclaimable`, and `parent`.
 
-## Behavior
+## Queue Resolution
 
-- A workload resolves its queue reference in this order:
-  1. `NamespaceQueue` in the workload namespace
-  2. cluster-scoped `Queue`
-- Existing users of cluster `Queue` do not need to change manifests.
-- `NamespaceQueue` uses the same queue fields as `Queue`, including `capability`, `deserved`, `guarantee`, `priority`, `reclaimable`, and `parent`.
+Workloads keep using the existing queue name fields. NamespaceQueue does not add a new workload field or require namespace-qualified queue names.
 
-## Create a NamespaceQueue
+For a workload in namespace `team-a` with queue name `training`, Volcano resolves the queue in this order:
+
+1. `NamespaceQueue` `team-a/training`
+2. Cluster-scoped `Queue` `training`
+
+This keeps existing cluster `Queue` users compatible. A `NamespaceQueue` only takes precedence inside its own namespace.
+
+## Create
 
 ```yaml
 apiVersion: scheduling.volcano.sh/v1beta1
 kind: NamespaceQueue
 metadata:
-  name: team-a
-  namespace: tenant-a
+  namespace: team-a
+  name: training
 spec:
-  weight: 1
-  reclaimable: true
+  weight: 6
+  parent: research
   deserved:
     cpu: "4"
     memory: 16Gi
@@ -31,33 +34,50 @@ spec:
     memory: 32Gi
 ```
 
-Apply it with:
-
 ```bash
 kubectl apply -f namespacequeue.yaml
 ```
 
-## Reference it from workloads
+## Use from Workloads
 
-Jobs and PodGroups keep using the existing queue field or annotation.
+Reference the queue by its plain name. Do not include the namespace in the workload queue value.
 
 ```yaml
 spec:
-  queue: team-a
+  queue: training
 ```
 
-or
+If the workload runs in namespace `team-a`, Volcano uses `NamespaceQueue` `team-a/training` when it exists. Otherwise, it falls back to cluster `Queue` `training`.
 
-```yaml
-metadata:
-  annotations:
-    scheduling.volcano.sh/queue-name: team-a
+## Manage
+
+Use the existing queue command with `--namespace` to operate on a `NamespaceQueue`:
+
+```bash
+vcctl queue operate --namespace team-a --name training --action close
+vcctl queue operate --namespace team-a --name training --action open
+vcctl queue operate --namespace team-a --name training --action update --weight 2
 ```
 
-If a `NamespaceQueue` named `team-a` exists in the workload namespace, Volcano uses it. Otherwise, Volcano falls back to the cluster `Queue` named `team-a`.
+Without `--namespace`, the command operates on a cluster-scoped `Queue`.
 
-## Notes
+## Compatibility and Migration
+
+Existing workloads do not need manifest changes. Keep using the same plain queue name as before.
+
+To migrate a tenant from a cluster `Queue` to a namespace-local queue:
+
+1. Create a `NamespaceQueue` in the tenant namespace with the same name as the existing cluster `Queue`.
+2. Leave Job, PodGroup, and Pod manifests unchanged.
+3. New and re-resolved workloads in that namespace use the `NamespaceQueue`.
+4. Other namespaces continue using their own matching `NamespaceQueue`, or the cluster `Queue` fallback.
+5. To roll back, delete the `NamespaceQueue`; workloads with the same queue name fall back to the cluster `Queue`.
+
+Migration is namespace-by-namespace and does not require changing workload queue references.
+
+## Constraints
 
 - `NamespaceQueue` named `root` is reserved.
 - Parent relationships for `NamespaceQueue` are namespace-local.
-- Queue status is updated through Volcano queue reconciliation in the same way as cluster queues.
+- Workloads can only be submitted to leaf queues.
+- Queue status is reconciled by Volcano in the same way as cluster queues.
