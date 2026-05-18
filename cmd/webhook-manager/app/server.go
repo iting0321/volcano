@@ -75,6 +75,15 @@ func Run(config *options.Config) error {
 	factory := informers.NewSharedInformerFactory(vClient, 0)
 
 	// Get the queue informer and add parent index for efficient child queue lookups
+	namespaceQueueInformerFactory := factory.Scheduling().V1beta1().NamespaceQueues()
+	namespaceQueueInformer := namespaceQueueInformerFactory.Informer()
+	if err := namespaceQueueInformer.AddIndexers(cache.Indexers{
+		router.NamespaceQueueParentIndexName: router.NamespaceQueueParentIndexFunc,
+	}); err != nil {
+		return fmt.Errorf("failed to add namespace queue parent indexer: %v", err)
+	}
+	namespaceQueueLister := namespaceQueueInformerFactory.Lister()
+
 	queueInformerFactory := factory.Scheduling().V1beta1().Queues()
 	queueInformer := queueInformerFactory.Informer()
 	if err := queueInformer.AddIndexers(cache.Indexers{
@@ -92,6 +101,8 @@ func Run(config *options.Config) error {
 		if service.Config != nil {
 			service.Config.VolcanoClient = vClient
 			service.Config.KubeClient = kubeClient
+			service.Config.NamespaceQueueLister = namespaceQueueLister
+			service.Config.NamespaceQueueInformer = namespaceQueueInformer
 			service.Config.QueueLister = queueLister
 			service.Config.QueueInformer = queueInformer
 			service.Config.SchedulerNames = config.SchedulerNames

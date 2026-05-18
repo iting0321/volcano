@@ -24,51 +24,60 @@ import (
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/controllers/apis"
 	"volcano.sh/volcano/pkg/controllers/metrics"
+	queueutil "volcano.sh/volcano/pkg/queue"
 )
+
+type queueHandlerView struct {
+	key    string
+	parent string
+}
 
 func (c *queuecontroller) enqueue(req *apis.Request) {
 	c.queue.Add(req)
 }
 
 func (c *queuecontroller) addQueue(obj interface{}) {
-	queue := obj.(*schedulingv1beta1.Queue)
+	queue, ok := getQueueHandlerView(obj)
+	if !ok {
+		klog.Errorf("Obj %v is not queue.", obj)
+		return
+	}
 
 	req := &apis.Request{
-		QueueName: queue.Name,
-
-		Event:  busv1alpha1.OutOfSyncEvent,
-		Action: busv1alpha1.SyncQueueAction,
+		QueueName: queue.key,
+		Event:     busv1alpha1.OutOfSyncEvent,
+		Action:    busv1alpha1.SyncQueueAction,
 	}
 
 	c.enqueue(req)
 }
 
 func (c *queuecontroller) deleteQueue(obj interface{}) {
-	queue, ok := obj.(*schedulingv1beta1.Queue)
+	queue, ok := getQueueHandlerViewFromTombstone(obj)
 	if !ok {
-		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			klog.Errorf("Couldn't get object from tombstone %#v.", obj)
-			return
-		}
-		queue, ok = tombstone.Obj.(*schedulingv1beta1.Queue)
-		if !ok {
-			klog.Errorf("Tombstone contained object that is not a Queue: %#v.", obj)
-			return
-		}
+		klog.Errorf("Couldn't get queue object %#v.", obj)
+		return
 	}
 
-	metrics.DeleteQueueMetrics(queue.Name)
+	metrics.DeleteQueueMetrics(queue.key)
 	c.pgMutex.Lock()
 	defer c.pgMutex.Unlock()
-	delete(c.podGroups, queue.Name)
+	delete(c.podGroups, queue.key)
 }
 
 func (c *queuecontroller) updateQueue(oldObj, newObj interface{}) {
-	oldQueue := oldObj.(*schedulingv1beta1.Queue)
-	newQueue := newObj.(*schedulingv1beta1.Queue)
+	oldQueue, ok := getQueueHandlerView(oldObj)
+	if !ok {
+		klog.Errorf("Old object %v is not queue.", oldObj)
+		return
+	}
+	newQueue, ok := getQueueHandlerView(newObj)
+	if !ok {
+		klog.Errorf("New object %v is not queue.", newObj)
+		return
+	}
 
-	if oldQueue.Spec.Parent != newQueue.Spec.Parent {
+	if oldQueue.parent != newQueue.parent {
 		c.addQueue(newObj)
 	}
 }
@@ -80,13 +89,14 @@ func (c *queuecontroller) addPodGroup(obj interface{}) {
 	c.pgMutex.Lock()
 	defer c.pgMutex.Unlock()
 
-	if c.podGroups[pg.Spec.Queue] == nil {
-		c.podGroups[pg.Spec.Queue] = make(map[string]struct{})
+	queueKey := c.resolveQueueKey(pg.Namespace, pg.Spec.Queue)
+	if c.podGroups[queueKey] == nil {
+		c.podGroups[queueKey] = make(map[string]struct{})
 	}
-	c.podGroups[pg.Spec.Queue][key] = struct{}{}
+	c.podGroups[queueKey][key] = struct{}{}
 
 	req := &apis.Request{
-		QueueName: pg.Spec.Queue,
+		QueueName: queueKey,
 
 		Event:  busv1alpha1.OutOfSyncEvent,
 		Action: busv1alpha1.SyncQueueAction,
@@ -126,10 +136,11 @@ func (c *queuecontroller) deletePodGroup(obj interface{}) {
 	c.pgMutex.Lock()
 	defer c.pgMutex.Unlock()
 
-	delete(c.podGroups[pg.Spec.Queue], key)
+	queueKey := c.resolveQueueKey(pg.Namespace, pg.Spec.Queue)
+	delete(c.podGroups[queueKey], key)
 
 	req := &apis.Request{
-		QueueName: pg.Spec.Queue,
+		QueueName: queueKey,
 
 		Event:  busv1alpha1.OutOfSyncEvent,
 		Action: busv1alpha1.SyncQueueAction,
@@ -164,11 +175,71 @@ func (c *queuecontroller) getPodGroups(key string) []string {
 }
 
 func (c *queuecontroller) recordEventsForQueue(name, eventType, reason, message string) {
+	if queueutil.IsNamespaceKey(name) {
+		namespace, queueName, ok := queueutil.ParseNamespaceKey(name)
+		if !ok {
+			klog.Errorf("Invalid namespace queue key %s", name)
+			return
+		}
+		queue, err := c.namespaceQueueLister.NamespaceQueues(namespace).Get(queueName)
+		if err != nil {
+			klog.Errorf("Get namespace queue %s failed for %v.", name, err)
+			return
+		}
+		c.recorder.Event(queue, eventType, reason, message)
+		return
+	}
+
 	queue, err := c.queueLister.Get(name)
+	if queueutil.IsClusterKey(name) {
+		name, _ = queueutil.ParseClusterKey(name)
+		queue, err = c.queueLister.Get(name)
+	}
 	if err != nil {
 		klog.Errorf("Get queue %s failed for %v.", name, err)
 		return
 	}
 
 	c.recorder.Event(queue, eventType, reason, message)
+}
+
+func (c *queuecontroller) resolveQueueKey(namespace, queueName string) string {
+	if queueName == "" {
+		return queueutil.ClusterKey(schedulingv1beta1.DefaultQueue)
+	}
+	resolved, err := queueutil.Resolve(namespace, queueName, c.queueLister, c.namespaceQueueLister)
+	if err != nil {
+		return queueutil.ClusterKey(queueName)
+	}
+	return resolved.Key
+}
+
+func getQueueHandlerView(obj interface{}) (queueHandlerView, bool) {
+	switch queue := obj.(type) {
+	case *schedulingv1beta1.Queue:
+		return queueHandlerView{
+			key:    queueutil.ClusterKey(queue.Name),
+			parent: queue.Spec.Parent,
+		}, true
+	case *schedulingv1beta1.NamespaceQueue:
+		return queueHandlerView{
+			key:    queueutil.NamespaceKey(queue.Namespace, queue.Name),
+			parent: queue.Spec.Parent,
+		}, true
+	default:
+		return queueHandlerView{}, false
+	}
+}
+
+func getQueueHandlerViewFromTombstone(obj interface{}) (queueHandlerView, bool) {
+	if queue, ok := getQueueHandlerView(obj); ok {
+		return queue, true
+	}
+
+	tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return queueHandlerView{}, false
+	}
+
+	return getQueueHandlerView(tombstone.Obj)
 }

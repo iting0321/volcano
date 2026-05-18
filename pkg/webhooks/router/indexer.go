@@ -27,7 +27,23 @@ import (
 const (
 	// QueueParentIndexName is the name of the index for parent queue lookup
 	QueueParentIndexName = "queueParent"
+	// NamespaceQueueParentIndexName is the name of the index for parent namespace queue lookup
+	NamespaceQueueParentIndexName = "namespaceQueueParent"
 )
+
+func parentIndexValues(namespace, parent string) []string {
+	if parent == "" {
+		return []string{}
+	}
+	if namespace == "" {
+		return []string{parent}
+	}
+	return []string{fmt.Sprintf("%s/%s", namespace, parent)}
+}
+
+func namespaceParentIndexKey(namespace, parent string) string {
+	return fmt.Sprintf("%s/%s", namespace, parent)
+}
 
 // QueueParentIndexFunc is an index function that indexes queues by their parent name
 // This allows efficient lookup of all children of a given parent queue
@@ -37,13 +53,17 @@ func QueueParentIndexFunc(obj interface{}) ([]string, error) {
 		return []string{}, nil
 	}
 
-	// Index by parent name
-	if queue.Spec.Parent != "" {
-		return []string{queue.Spec.Parent}, nil
+	return parentIndexValues("", queue.Spec.Parent), nil
+}
+
+// NamespaceQueueParentIndexFunc indexes namespace queues by namespace and parent name.
+func NamespaceQueueParentIndexFunc(obj interface{}) ([]string, error) {
+	queue, ok := obj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		return []string{}, nil
 	}
 
-	// Root queue or queues without parent
-	return []string{}, nil
+	return parentIndexValues(queue.Namespace, queue.Spec.Parent), nil
 }
 
 // GetQueuesByParent returns all queues that have the specified parent using the queue parent index.
@@ -77,6 +97,46 @@ func (asc *AdmissionServiceConfig) GetQueuesByParent(parentName string) ([]*sche
 	}
 
 	queues := make([]*schedulingv1beta1.Queue, 0)
+	for _, queue := range allQueues {
+		if queue.Spec.Parent == parentName {
+			queues = append(queues, queue)
+		}
+	}
+
+	return queues, nil
+}
+
+// GetNamespaceQueuesByParent returns all namespace queues in a namespace with the specified parent.
+func (asc *AdmissionServiceConfig) GetNamespaceQueuesByParent(namespace, parentName string) ([]*schedulingv1beta1.NamespaceQueue, error) {
+	indexKey := namespaceParentIndexKey(namespace, parentName)
+	if asc.NamespaceQueueInformer != nil {
+		objs, err := asc.NamespaceQueueInformer.GetIndexer().ByIndex(NamespaceQueueParentIndexName, indexKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query index %s for parent %s: %v", NamespaceQueueParentIndexName, indexKey, err)
+		}
+
+		queues := make([]*schedulingv1beta1.NamespaceQueue, 0, len(objs))
+		for _, obj := range objs {
+			queue, ok := obj.(*schedulingv1beta1.NamespaceQueue)
+			if !ok {
+				continue
+			}
+			queues = append(queues, queue)
+		}
+
+		return queues, nil
+	}
+
+	if asc.NamespaceQueueLister == nil {
+		return nil, nil
+	}
+
+	allQueues, err := asc.NamespaceQueueLister.NamespaceQueues(namespace).List(labels.Everything())
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespace queues: %v", err)
+	}
+
+	queues := make([]*schedulingv1beta1.NamespaceQueue, 0)
 	for _, queue := range allQueues {
 		if queue.Spec.Parent == parentName {
 			queues = append(queues, queue)

@@ -22,11 +22,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/volcano/cmd/scheduler/app/options"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/actions/enqueue"
 	"volcano.sh/volcano/pkg/scheduler/actions/reclaim"
@@ -835,6 +837,20 @@ func buildQueueWithParents(name string, parent string, deserved corev1.ResourceL
 	return queue
 }
 
+func buildNamespaceQueueWithParents(namespace, name, parent string, deserved corev1.ResourceList, cap corev1.ResourceList) *schedulingv1beta1.NamespaceQueue {
+	return &schedulingv1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
+		Spec: schedulingv1beta1.QueueSpec{
+			Parent:     parent,
+			Deserved:   deserved,
+			Capability: cap,
+		},
+	}
+}
+
 func Test_updateQueueAttrShare(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1071,6 +1087,51 @@ func Test_buildHierarchicalQueueAttrs_nilSafety(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func Test_buildHierarchicalQueueAttrs_namespaceQueueRoot(t *testing.T) {
+	sc := cache.NewCustomMockSchedulerCache("test-capacity", nil, nil, nil, nil, nil)
+	stop := make(chan struct{})
+	defer close(stop)
+	sc.Run(stop)
+
+	parent := buildNamespaceQueueWithParents("team-a", "parent", "", nil, api.BuildResourceList("4", "4Gi"))
+	child := buildNamespaceQueueWithParents("team-a", "child", "parent", api.BuildResourceList("1", "1Gi"), nil)
+	sc.AddNamespaceQueueV1beta1(parent)
+	sc.AddNamespaceQueueV1beta1(child)
+
+	ssn := framework.OpenSession(sc, nil, nil)
+	defer framework.CloseSession(ssn)
+
+	cp := New(framework.Arguments{}).(*capacityPlugin)
+	if ok := cp.buildHierarchicalQueueAttrs(ssn); !ok {
+		t.Fatal("buildHierarchicalQueueAttrs() = false, want true for namespace queue hierarchy without cluster root queue")
+	}
+
+	parentID := api.QueueID(queueutil.NamespaceKey("team-a", "parent"))
+	childID := api.QueueID(queueutil.NamespaceKey("team-a", "child"))
+
+	parentAttr, found := cp.queueOpts[parentID]
+	if !found {
+		t.Fatalf("expected parent namespace queue attr %q to exist", parentID)
+	}
+	childAttr, found := cp.queueOpts[childID]
+	if !found {
+		t.Fatalf("expected child namespace queue attr %q to exist", childID)
+	}
+
+	if len(parentAttr.ancestors) != 0 {
+		t.Fatalf("expected top-level namespace queue to have no ancestors, got %v", parentAttr.ancestors)
+	}
+	if len(childAttr.ancestors) != 1 || childAttr.ancestors[0] != parentID {
+		t.Fatalf("expected child ancestors [%q], got %v", parentID, childAttr.ancestors)
+	}
+	if _, found := parentAttr.children[childID]; !found {
+		t.Fatalf("expected parent queue %q to include child %q", parentID, childID)
+	}
+	if childAttr.capability.MilliCPU != parentAttr.capability.MilliCPU {
+		t.Fatalf("expected child capability to inherit parent CPU capability, got child=%v parent=%v", childAttr.capability.MilliCPU, parentAttr.capability.MilliCPU)
 	}
 }
 

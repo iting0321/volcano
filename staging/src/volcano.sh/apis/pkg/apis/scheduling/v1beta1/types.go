@@ -367,6 +367,32 @@ type Queue struct {
 	Status QueueStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
 }
 
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:path=namespacequeues,scope=Namespaced,shortName=nq;namespacequeue-v1beta1
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="STATE",type=string,JSONPath=`.status.state`
+// +kubebuilder:printcolumn:name="WEIGHT",type=integer,JSONPath=`.spec.weight`
+// +kubebuilder:printcolumn:name="PARENT",type=string,JSONPath=`.spec.parent`
+
+// NamespaceQueue is a namespace-scoped queue of PodGroup.
+type NamespaceQueue struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+	// Specification of the desired behavior of the namespace queue.
+	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#spec-and-status
+	// +optional
+	Spec QueueSpec `json:"spec,omitempty" protobuf:"bytes,2,opt,name=spec"`
+
+	// The status of namespace queue.
+	// +optional
+	Status QueueStatus `json:"status,omitempty" protobuf:"bytes,3,opt,name=status"`
+}
+
 // Guarantee represents configuration of queue resource reservation
 type Guarantee struct {
 	// The amount of cluster resource reserved for queue. Just set either `percentage` or `resource`
@@ -532,4 +558,19 @@ type QueueList struct {
 
 	// items is the list of PodGroup
 	Items []Queue `json:"items" protobuf:"bytes,2,rep,name=items"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:object:root=true
+
+// NamespaceQueueList is a collection of namespace queues.
+type NamespaceQueueList struct {
+	metav1.TypeMeta `json:",inline"`
+	// Standard list metadata
+	// More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata
+	// +optional
+	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+
+	// items is the list of NamespaceQueue
+	Items []NamespaceQueue `json:"items" protobuf:"bytes,2,rep,name=items"`
 }

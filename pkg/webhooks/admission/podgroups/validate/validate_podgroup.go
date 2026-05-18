@@ -26,6 +26,7 @@ import (
 	"k8s.io/klog/v2"
 
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	"volcano.sh/volcano/pkg/webhooks/router"
 	"volcano.sh/volcano/pkg/webhooks/schema"
 	"volcano.sh/volcano/pkg/webhooks/util"
@@ -92,23 +93,32 @@ func Validate(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 func validatePodGroup(pg *schedulingv1beta1.PodGroup) string {
 	var errMsg string
 
-	errMsg += checkQueueState(pg.Spec.Queue)
+	errMsg += checkQueueState(pg.Namespace, pg.Spec.Queue)
 	errMsg += validateNetworkTopology(pg.Spec.NetworkTopology, pg.Spec.SubGroupPolicy)
 
 	return errMsg
 }
 
 // checkQueueState verifies if the queue exists and is in the open state
-func checkQueueState(queueName string) string {
+func checkQueueState(namespace, queueName string) string {
 	if queueName == "" {
 		return ""
 	}
 
-	queue, err := config.QueueLister.Get(queueName)
+	queueRef, err := queueutil.Resolve(namespace, queueName, config.QueueLister, config.NamespaceQueueLister)
 	if err != nil {
 		return fmt.Sprintf("unable to find queue: %s", err.Error())
 	}
 
+	if queueRef.NamespaceQueue != nil {
+		if queueRef.NamespaceQueue.Status.State != schedulingv1beta1.QueueStateOpen {
+			return fmt.Sprintf("can only submit PodGroup to queue with state `Open`, queue `%s/%s` status is `%s`. ",
+				queueRef.Namespace, queueRef.Name, queueRef.NamespaceQueue.Status.State)
+		}
+		return ""
+	}
+
+	queue := queueRef.Queue
 	if queue.Status.State != schedulingv1beta1.QueueStateOpen {
 		return fmt.Sprintf("can only submit PodGroup to queue with state `Open`, queue `%s` status is `%s`. ",
 			queue.Name, queue.Status.State)

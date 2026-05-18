@@ -103,6 +103,7 @@ type jobcontroller struct {
 	cmdInformer   businformer.CommandInformer
 	pcInformer    kubeschedulinginformers.PriorityClassInformer
 	queueInformer schedulinginformers.QueueInformer
+	namespaceQueueInformer schedulinginformers.NamespaceQueueInformer
 
 	informerFactory   informers.SharedInformerFactory
 	vcInformerFactory vcinformer.SharedInformerFactory
@@ -134,6 +135,8 @@ type jobcontroller struct {
 
 	queueLister schedulinglisters.QueueLister
 	queueSynced func() bool
+	namespaceQueueLister schedulinglisters.NamespaceQueueLister
+	namespaceQueueSynced func() bool
 
 	// queue that need to sync up
 	queueList    []workqueue.TypedRateLimitingInterface[any]
@@ -260,6 +263,9 @@ func (cc *jobcontroller) Initialize(opt *framework.ControllerOption) error {
 	cc.queueInformer = factory.Scheduling().V1beta1().Queues()
 	cc.queueLister = cc.queueInformer.Lister()
 	cc.queueSynced = cc.queueInformer.Informer().HasSynced
+	cc.namespaceQueueInformer = factory.Scheduling().V1beta1().NamespaceQueues()
+	cc.namespaceQueueLister = cc.namespaceQueueInformer.Lister()
+	cc.namespaceQueueSynced = cc.namespaceQueueInformer.Informer().HasSynced
 
 	cc.delayActionMap = make(map[string]map[string]*delayAction)
 

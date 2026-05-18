@@ -37,6 +37,7 @@ import (
 	"volcano.sh/volcano/pkg/controllers/apis"
 	jobhelpers "volcano.sh/volcano/pkg/controllers/job/helpers"
 	"volcano.sh/volcano/pkg/controllers/job/state"
+	queueutil "volcano.sh/volcano/pkg/queue"
 )
 
 var calMutex sync.Mutex
@@ -331,13 +332,13 @@ func (cc *jobcontroller) initOnJobUpdate(job *batch.Job) error {
 	return nil
 }
 
-func (cc *jobcontroller) GetQueueInfo(queue string) (*scheduling.Queue, error) {
-	queueInfo, err := cc.queueLister.Get(queue)
+func (cc *jobcontroller) GetQueueInfo(namespace, queue string) (*scheduling.Queue, error) {
+	queueRef, err := queueutil.Resolve(namespace, queue, cc.queueLister, cc.namespaceQueueLister)
 	if err != nil {
-		klog.Errorf("Failed to get queue from queueLister, error: %s", err.Error())
+		klog.Errorf("Failed to get queue from listers, error: %s", err.Error())
+		return nil, err
 	}
-
-	return queueInfo, err
+	return queueRef.AsPodGroupQueue(), nil
 }
 
 func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.UpdateStatusFn) error {
@@ -355,7 +356,7 @@ func (cc *jobcontroller) syncJob(jobInfo *apis.JobInfo, updateStatus state.Updat
 	job = job.DeepCopy()
 
 	// Find queue that job belongs to, and check if the queue has forwarding metadata
-	queueInfo, err := cc.GetQueueInfo(job.Spec.Queue)
+	queueInfo, err := cc.GetQueueInfo(job.Namespace, job.Spec.Queue)
 	if err != nil {
 		return err
 	}

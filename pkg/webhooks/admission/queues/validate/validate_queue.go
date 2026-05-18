@@ -59,7 +59,7 @@ var service = &router.AdmissionService{
 					Rule: whv1.Rule{
 						APIGroups:   []string{schedulingv1beta1.SchemeGroupVersion.Group},
 						APIVersions: []string{schedulingv1beta1.SchemeGroupVersion.Version},
-						Resources:   []string{"queues"},
+						Resources:   []string{"queues", "namespacequeues"},
 					},
 				},
 			},
@@ -69,9 +69,42 @@ var service = &router.AdmissionService{
 
 var config = &router.AdmissionServiceConfig{}
 
+type queueValidationView interface {
+	queueName() string
+	queueSpec() *schedulingv1beta1.QueueSpec
+	queueStatus() *schedulingv1beta1.QueueStatus
+}
+
+type queueValidationAdapter struct {
+	name   string
+	spec   *schedulingv1beta1.QueueSpec
+	status *schedulingv1beta1.QueueStatus
+}
+
+func (a queueValidationAdapter) queueName() string {
+	return a.name
+}
+
+func (a queueValidationAdapter) queueSpec() *schedulingv1beta1.QueueSpec {
+	return a.spec
+}
+
+func (a queueValidationAdapter) queueStatus() *schedulingv1beta1.QueueStatus {
+	return a.status
+}
+
+type queueValidationOptions struct {
+	disallowRootName   bool
+	disallowSelfParent bool
+}
+
 // AdmitQueues is to admit queues and return response.
 func AdmitQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
 	klog.V(3).Infof("Admitting %s queue %s.", ar.Request.Operation, ar.Request.Name)
+
+	if ar.Request.Resource.Resource == "namespacequeues" {
+		return admitNamespaceQueues(ar)
+	}
 
 	queue, err := schema.DecodeQueue(ar.Request.Object, ar.Request.Resource)
 	if err != nil {
@@ -130,18 +163,36 @@ func AdmitQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse 
 }
 
 func validateQueue(queue *schedulingv1beta1.Queue) error {
-	errs := field.ErrorList{}
-	resourcePath := field.NewPath("requestBody")
-
-	errs = append(errs, validateResourceQuantityOfQueue(queue.Spec, resourcePath.Child("spec"))...)
-	errs = append(errs, validateStateOfQueue(queue.Status.State, resourcePath.Child("spec").Child("state"))...)
-	errs = append(errs, validateHierarchicalAttributes(queue, resourcePath.Child("metadata").Child("annotations"))...)
+	errs := validateQueueCommon(queueValidationAdapter{
+		name:   queue.Name,
+		spec:   &queue.Spec,
+		status: &queue.Status,
+	}, queueValidationOptions{})
+	errs = append(errs, validateHierarchicalAttributes(queue, field.NewPath("requestBody").Child("metadata").Child("annotations"))...)
 
 	if len(errs) > 0 {
 		return errs.ToAggregate()
 	}
 
 	return nil
+}
+
+func validateQueueCommon(queue queueValidationView, opts queueValidationOptions) field.ErrorList {
+	errs := field.ErrorList{}
+	resourcePath := field.NewPath("requestBody")
+	spec := queue.queueSpec()
+	status := queue.queueStatus()
+
+	errs = append(errs, validateResourceQuantityOfQueue(*spec, resourcePath.Child("spec"))...)
+	errs = append(errs, validateStateOfQueue(status.State, resourcePath.Child("spec").Child("state"))...)
+	if opts.disallowRootName && queue.queueName() == "root" {
+		errs = append(errs, field.Invalid(resourcePath.Child("metadata").Child("name"), queue.queueName(), "namespace queue name `root` is reserved"))
+	}
+	if opts.disallowSelfParent && spec.Parent == queue.queueName() {
+		errs = append(errs, field.Invalid(resourcePath.Child("spec").Child("parent"), spec.Parent, "queue cannot use itself as parent"))
+	}
+
+	return errs
 }
 
 func validateHierarchicalAttributes(queue *schedulingv1beta1.Queue, fldPath *field.Path) field.ErrorList {
@@ -682,4 +733,319 @@ func validateChildrenConstraints(parent *schedulingv1beta1.Queue, children []*sc
 	}
 
 	return nil
+}
+
+func admitNamespaceQueues(ar admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
+	namespaceQueue, err := schema.DecodeNamespaceQueue(ar.Request.Object, ar.Request.Resource)
+	if err != nil {
+		return util.ToAdmissionResponse(err)
+	}
+
+	switch ar.Request.Operation {
+	case admissionv1.Create, admissionv1.Update:
+		if err := validateNamespaceQueue(namespaceQueue); err != nil {
+			return util.ToAdmissionResponse(err)
+		}
+		var oldNamespaceQueue *schedulingv1beta1.NamespaceQueue
+		if ar.Request.Operation == admissionv1.Update {
+			oldNamespaceQueue, err = schema.DecodeNamespaceQueue(ar.Request.OldObject, ar.Request.Resource)
+			if err != nil {
+				return util.ToAdmissionResponse(err)
+			}
+			if oldNamespaceQueue.Spec.Parent != namespaceQueue.Spec.Parent {
+				if err := validateNamespaceQueueParent(namespaceQueue); err != nil {
+					return util.ToAdmissionResponse(err)
+				}
+			}
+		} else if err := validateNamespaceQueueParent(namespaceQueue); err != nil {
+			return util.ToAdmissionResponse(err)
+		}
+		if needsValidateHierarchicalNamespaceQueue(namespaceQueue, oldNamespaceQueue, ar.Request.Operation) {
+			if err := validateHierarchicalNamespaceQueueResources(namespaceQueue); err != nil {
+				return util.ToAdmissionResponse(err)
+			}
+		}
+	case admissionv1.Delete:
+		if err := validateNamespaceQueueDeleting(ar.Request.Namespace, ar.Request.Name); err != nil {
+			return util.ToAdmissionResponse(err)
+		}
+	default:
+		return util.ToAdmissionResponse(fmt.Errorf("invalid operation `%s`, expect operation to be `CREATE`, `UPDATE` or `DELETE`", ar.Request.Operation))
+	}
+
+	return &admissionv1.AdmissionResponse{Allowed: true}
+}
+
+func validateNamespaceQueue(queue *schedulingv1beta1.NamespaceQueue) error {
+	errs := validateQueueCommon(queueValidationAdapter{
+		name:   queue.Name,
+		spec:   &queue.Spec,
+		status: &queue.Status,
+	}, queueValidationOptions{disallowRootName: true, disallowSelfParent: true})
+	if len(errs) > 0 {
+		return errs.ToAggregate()
+	}
+	return nil
+}
+
+func validateNamespaceQueueParent(queue *schedulingv1beta1.NamespaceQueue) error {
+	if queue.Spec.Parent == "" {
+		return nil
+	}
+	if config.NamespaceQueueLister == nil {
+		return fmt.Errorf("namespace queue lister is not initialized")
+	}
+	return validateNamespaceQueueDepth(queue)
+}
+
+func validateNamespaceQueueDepth(queue *schedulingv1beta1.NamespaceQueue) error {
+	depth := 1
+	parent := queue.Spec.Parent
+	visited := map[string]struct{}{
+		queue.Name: {},
+	}
+
+	for parent != "" {
+		if _, found := visited[parent]; found {
+			return fmt.Errorf("namespace queue %s/%s creates a cycle in parent hierarchy via %s", queue.Namespace, queue.Name, parent)
+		}
+		visited[parent] = struct{}{}
+
+		depth++
+		if depth > config.MaxQueueDepth {
+			return fmt.Errorf("namespace queue %s/%s exceeds the maximum allowed depth of %d", queue.Namespace, queue.Name, config.MaxQueueDepth)
+		}
+
+		p, err := config.NamespaceQueueLister.NamespaceQueues(queue.Namespace).Get(parent)
+		if err != nil {
+			return fmt.Errorf("failed to get parent namespace queue %s of queue %s/%s: %v", parent, queue.Namespace, queue.Name, err)
+		}
+		parent = p.Spec.Parent
+	}
+
+	return nil
+}
+
+func validateNamespaceQueueDeleting(namespace, name string) error {
+	if config.NamespaceQueueLister == nil {
+		return nil
+	}
+	queue, err := config.NamespaceQueueLister.NamespaceQueues(namespace).Get(name)
+	if err != nil {
+		return err
+	}
+	if queue.Status.State != schedulingv1beta1.QueueStateClosed {
+		return fmt.Errorf("only queue with state `Closed` can be deleted")
+	}
+	children, err := config.GetNamespaceQueuesByParent(namespace, name)
+	if err != nil {
+		return err
+	}
+	if len(children) > 0 {
+		return fmt.Errorf("namespace queue %s/%s still has %d child queues", namespace, name, len(children))
+	}
+	return nil
+}
+
+func needsValidateHierarchicalNamespaceQueue(queue, oldQueue *schedulingv1beta1.NamespaceQueue, operation admissionv1.Operation) bool {
+	if operation == admissionv1.Create {
+		return true
+	}
+
+	if operation == admissionv1.Update && oldQueue != nil {
+		if queue.Spec.Parent != oldQueue.Spec.Parent {
+			return true
+		}
+		if !equality.Semantic.DeepEqual(queue.Spec.Capability, oldQueue.Spec.Capability) {
+			return true
+		}
+		if !equality.Semantic.DeepEqual(queue.Spec.Deserved, oldQueue.Spec.Deserved) {
+			return true
+		}
+		if !equality.Semantic.DeepEqual(queue.Spec.Guarantee.Resource, oldQueue.Spec.Guarantee.Resource) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func validateHierarchicalNamespaceQueueResources(queue *schedulingv1beta1.NamespaceQueue) error {
+	if queue.Spec.Parent != "" {
+		parentQueue, err := config.NamespaceQueueLister.NamespaceQueues(queue.Namespace).Get(queue.Spec.Parent)
+		if err != nil {
+			return fmt.Errorf("parent namespace queue %s/%s not found: %v", queue.Namespace, queue.Spec.Parent, err)
+		}
+
+		if err := validateNamespaceChildAgainstAncestor(queue); err != nil {
+			return err
+		}
+
+		siblings, err := config.GetNamespaceQueuesByParent(queue.Namespace, queue.Spec.Parent)
+		if err != nil {
+			return fmt.Errorf("failed to get sibling namespace queues: %v", err)
+		}
+
+		if err := validateNamespaceSiblingsSum(queue, parentQueue, siblings); err != nil {
+			return err
+		}
+	}
+
+	children, err := config.GetNamespaceQueuesByParent(queue.Namespace, queue.Name)
+	if err != nil {
+		return fmt.Errorf("failed to get child namespace queues: %v", err)
+	}
+
+	if len(children) > 0 {
+		if err := validateNamespaceChildrenConstraints(queue, children); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateNamespaceChildAgainstAncestor(child *schedulingv1beta1.NamespaceQueue) error {
+	if child.Spec.Capability == nil {
+		return nil
+	}
+
+	qRes := api.NewResource(child.Spec.Capability)
+	for _, resourceName := range qRes.ResourceNames() {
+		childValue := getSingleResource(qRes, resourceName)
+		if parentValue, ok := findNearestNamespaceAncestorCapability(child, resourceName); ok && childValue > parentValue {
+			return fmt.Errorf("namespace queue %s/%s capability[%s]=%v exceeds its ancestor's capability=%v",
+				child.Namespace, child.Name, resourceName, formatResourceWithType(resourceName, childValue), formatResourceWithType(resourceName, parentValue))
+		}
+	}
+
+	return nil
+}
+
+func findNearestNamespaceAncestorCapability(q *schedulingv1beta1.NamespaceQueue, resourceName v1.ResourceName) (float64, bool) {
+	parent := q.Spec.Parent
+	for parent != "" {
+		parentQueue, err := config.NamespaceQueueLister.NamespaceQueues(q.Namespace).Get(parent)
+		if err != nil {
+			return 0, false
+		}
+
+		if parentQueue.Spec.Capability != nil {
+			parentRes := api.NewResource(parentQueue.Spec.Capability)
+			if value := getSingleResource(parentRes, resourceName); value > 0 {
+				return value, true
+			}
+		}
+
+		parent = parentQueue.Spec.Parent
+	}
+
+	return 0, false
+}
+
+func validateNamespaceSiblingsSum(queue, parent *schedulingv1beta1.NamespaceQueue, siblings []*schedulingv1beta1.NamespaceQueue) error {
+	totalGuarantee := api.EmptyResource()
+	totalDeserved := api.EmptyResource()
+
+	parentGuarantee := api.NewResource(parent.Spec.Guarantee.Resource)
+	parentDeserved := api.NewResource(parent.Spec.Deserved)
+
+	for _, sibling := range siblings {
+		if sibling.Name == queue.Name {
+			continue
+		}
+
+		totalGuarantee.Add(api.NewResource(sibling.Spec.Guarantee.Resource))
+		if parentGuarantee.LessPartly(totalGuarantee, api.Zero) {
+			return fmt.Errorf("parent namespace queue %s/%s validation failed: sum of children's guarantee (%s) exceeds parent's guarantee limit (%s)",
+				parent.Namespace, parent.Name, totalGuarantee, parentGuarantee)
+		}
+
+		totalDeserved.Add(api.NewResource(sibling.Spec.Deserved))
+		if parentDeserved.LessPartly(totalDeserved, api.Zero) {
+			return fmt.Errorf("parent namespace queue %s/%s validation failed: sum of children's deserved (%s) exceeds parent's deserved limit (%s)",
+				parent.Namespace, parent.Name, totalDeserved, parentDeserved)
+		}
+	}
+
+	totalGuarantee.Add(api.NewResource(queue.Spec.Guarantee.Resource))
+	if parentGuarantee.LessPartly(totalGuarantee, api.Zero) {
+		return fmt.Errorf("parent namespace queue %s/%s validation failed: sum of children's guarantee (%s) exceeds parent's guarantee limit (%s)",
+			parent.Namespace, parent.Name, totalGuarantee, parentGuarantee)
+	}
+
+	totalDeserved.Add(api.NewResource(queue.Spec.Deserved))
+	if parentDeserved.LessPartly(totalDeserved, api.Zero) {
+		return fmt.Errorf("parent namespace queue %s/%s validation failed: sum of children's deserved (%s) exceeds parent's deserved limit (%s)",
+			parent.Namespace, parent.Name, totalDeserved, parentDeserved)
+	}
+
+	return nil
+}
+
+func validateNamespaceChildrenConstraints(parent *schedulingv1beta1.NamespaceQueue, children []*schedulingv1beta1.NamespaceQueue) error {
+	totalGuarantee := api.EmptyResource()
+	totalDeserved := api.EmptyResource()
+
+	if parent.Spec.Capability != nil {
+		parentRes := api.NewResource(parent.Spec.Capability)
+		for _, resourceName := range parentRes.ResourceNames() {
+			parentValue := getSingleResource(parentRes, resourceName)
+			childMax := float64(0)
+
+			for _, child := range children {
+				value := findNamespaceSubtreeMaxCapability(child, resourceName)
+				if value > childMax {
+					childMax = value
+				}
+			}
+
+			if parentValue < childMax {
+				return fmt.Errorf("namespace queue %s/%s capability[%s]=%v is smaller than its descendants' max capability=%v",
+					parent.Namespace, parent.Name, resourceName, formatResourceWithType(resourceName, parentValue), formatResourceWithType(resourceName, childMax))
+			}
+		}
+	}
+
+	parentGuarantee := api.NewResource(parent.Spec.Guarantee.Resource)
+	parentDeserved := api.NewResource(parent.Spec.Deserved)
+	for _, child := range children {
+		totalGuarantee.Add(api.NewResource(child.Spec.Guarantee.Resource))
+		if parentGuarantee.LessPartly(totalGuarantee, api.Zero) {
+			return fmt.Errorf("namespace queue %s/%s validation failed: sum of children's guarantee (%s) exceeds parent's guarantee limit (%s)",
+				parent.Namespace, parent.Name, totalGuarantee, parentGuarantee)
+		}
+
+		totalDeserved.Add(api.NewResource(child.Spec.Deserved))
+		if parentDeserved.LessPartly(totalDeserved, api.Zero) {
+			return fmt.Errorf("namespace queue %s/%s validation failed: sum of children's deserved (%s) exceeds parent's deserved limit (%s)",
+				parent.Namespace, parent.Name, totalDeserved, parentDeserved)
+		}
+	}
+
+	return nil
+}
+
+func findNamespaceSubtreeMaxCapability(q *schedulingv1beta1.NamespaceQueue, resourceName v1.ResourceName) float64 {
+	if q.Spec.Capability != nil {
+		queueRes := api.NewResource(q.Spec.Capability)
+		if value := getSingleResource(queueRes, resourceName); value > 0 {
+			return value
+		}
+	}
+
+	children, err := config.GetNamespaceQueuesByParent(q.Namespace, q.Name)
+	if err != nil {
+		return 0
+	}
+
+	maxValue := float64(0)
+	for _, child := range children {
+		value := findNamespaceSubtreeMaxCapability(child, resourceName)
+		if value > maxValue {
+			maxValue = value
+		}
+	}
+
+	return maxValue
 }

@@ -32,7 +32,7 @@ const (
 	// PluginName indicates name of volcano scheduler plugin.
 	PluginName       = "nodegroup"
 	NodeGroupNameKey = "volcano.sh/nodegroup-name"
-	rootQueueID      = "root"
+	rootQueueID      = "cluster:root"
 
 	BaseScore = 100
 )

@@ -49,6 +49,19 @@ func addToScheme(scheme *runtime.Scheme) {
 	utilruntime.Must(admissionv1.AddToScheme(scheme))
 }
 
+func decodeResource[T runtime.Object](object runtime.RawExtension, resource, expected metav1.GroupVersionResource, out T) (T, error) {
+	if resource != expected {
+		klog.Errorf("expect resource to be %s", expected)
+		return out, fmt.Errorf("expect resource to be %s", expected)
+	}
+
+	if _, _, err := Codecs.UniversalDeserializer().Decode(object.Raw, nil, out); err != nil {
+		return out, err
+	}
+
+	return out, nil
+}
+
 // DecodeJob decodes the job using deserializer from the raw object.
 func DecodeJob(object runtime.RawExtension, resource metav1.GroupVersionResource) (*batchv1alpha1.Job, error) {
 	jobResource := metav1.GroupVersionResource{Group: batchv1alpha1.SchemeGroupVersion.Group, Version: batchv1alpha1.SchemeGroupVersion.Version, Resource: "jobs"}
@@ -117,18 +130,17 @@ func DecodeQueue(object runtime.RawExtension, resource metav1.GroupVersionResour
 		Version:  schedulingv1beta1.SchemeGroupVersion.Version,
 		Resource: "queues",
 	}
+	return decodeResource(object, resource, queueResource, &schedulingv1beta1.Queue{})
+}
 
-	if resource != queueResource {
-		klog.Errorf("expect resource to be %s", queueResource)
-		return nil, fmt.Errorf("expect resource to be %s", queueResource)
+// DecodeNamespaceQueue decodes the namespace queue using deserializer from the raw object.
+func DecodeNamespaceQueue(object runtime.RawExtension, resource metav1.GroupVersionResource) (*schedulingv1beta1.NamespaceQueue, error) {
+	namespaceQueueResource := metav1.GroupVersionResource{
+		Group:    schedulingv1beta1.SchemeGroupVersion.Group,
+		Version:  schedulingv1beta1.SchemeGroupVersion.Version,
+		Resource: "namespacequeues",
 	}
-
-	queue := schedulingv1beta1.Queue{}
-	if _, _, err := Codecs.UniversalDeserializer().Decode(object.Raw, nil, &queue); err != nil {
-		return nil, err
-	}
-
-	return &queue, nil
+	return decodeResource(object, resource, namespaceQueueResource, &schedulingv1beta1.NamespaceQueue{})
 }
 
 // DecodePodGroup decodes the podgroup using deserializer from the raw object.

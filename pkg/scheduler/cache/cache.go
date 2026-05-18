@@ -70,6 +70,7 @@ import (
 
 	"volcano.sh/volcano/cmd/scheduler/app/options"
 	"volcano.sh/volcano/pkg/features"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
 	"volcano.sh/volcano/pkg/scheduler/metrics/source"
@@ -121,6 +122,7 @@ type SchedulerCache struct {
 	nodeInformer               infov1.NodeInformer
 	hyperNodeInformer          topologyinformerv1alpha1.HyperNodeInformer
 	podGroupInformerV1beta1    vcinformerv1.PodGroupInformer
+	namespaceQueueInformerV1beta1 vcinformerv1.NamespaceQueueInformer
 	queueInformerV1beta1       vcinformerv1.QueueInformer
 	pvInformer                 infov1.PersistentVolumeInformer
 	pvcInformer                infov1.PersistentVolumeClaimInformer
@@ -371,6 +373,23 @@ func (su *defaultStatusUpdater) UpdatePodGroup(pg *schedulingapi.PodGroup) (*sch
 
 // UpdateQueueStatus will update the status of queue
 func (su *defaultStatusUpdater) UpdateQueueStatus(queue *schedulingapi.QueueInfo) error {
+	if queue.Scope == queueutil.NamespaceQueueScope {
+		if queue.NamespaceQueue == nil {
+			return fmt.Errorf("namespace queue info %q is missing backing NamespaceQueue", queue.Name)
+		}
+
+		newNamespaceQueue := queue.NamespaceQueue.DeepCopy()
+		if err := schedulingscheme.Scheme.Convert(&queue.Queue.Status, &newNamespaceQueue.Status, nil); err != nil {
+			klog.Errorf("error occurred in converting scheduling.QueueStatus to v1beta1.QueueStatus: %s", err.Error())
+			return err
+		}
+		_, err := su.vcclient.SchedulingV1beta1().NamespaceQueues(newNamespaceQueue.Namespace).UpdateStatus(context.TODO(), newNamespaceQueue, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Errorf("error occurred in updating namespace queue status %s/%s: %s", newNamespaceQueue.Namespace, newNamespaceQueue.Name, err.Error())
+		}
+		return err
+	}
+
 	newQueue := &vcv1beta1.Queue{}
 	if err := schedulingscheme.Scheme.Convert(queue.Queue, newQueue, nil); err != nil {
 		klog.Errorf("error occurred in converting scheduling.Queue to v1beta1.Queue: %s", err.Error())
@@ -782,6 +801,14 @@ func (sc *SchedulerCache) addEventHandler() {
 			},
 		})
 	handlers["podgroup"] = handlerRegistration
+
+	sc.namespaceQueueInformerV1beta1 = vcinformers.Scheduling().V1beta1().NamespaceQueues()
+	handlerRegistration, _ = sc.namespaceQueueInformerV1beta1.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    sc.AddNamespaceQueueV1beta1,
+		UpdateFunc: sc.UpdateNamespaceQueueV1beta1,
+		DeleteFunc: sc.DeleteNamespaceQueueV1beta1,
+	})
+	handlers["namespacequeue"] = handlerRegistration
 
 	// create informer(v1beta1) for Queue information
 	sc.queueInformerV1beta1 = vcinformers.Scheduling().V1beta1().Queues()

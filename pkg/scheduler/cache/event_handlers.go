@@ -55,6 +55,7 @@ import (
 	nodeshardv1alpha1 "volcano.sh/apis/pkg/apis/shard/v1alpha1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	"volcano.sh/apis/pkg/apis/utils"
+	queueutil "volcano.sh/volcano/pkg/queue"
 	schedulingapi "volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
 	schedulercache "volcano.sh/volcano/pkg/schedulercommon/cache"
@@ -796,11 +797,7 @@ func (sc *SchedulerCache) setPodGroup(ss *schedulingapi.PodGroup) error {
 	}
 
 	sc.Jobs[job].SetPodGroup(ss)
-
-	// TODO(k82cn): set default queue in admission.
-	if len(ss.Spec.Queue) == 0 {
-		sc.Jobs[job].Queue = schedulingapi.QueueID(sc.defaultQueue)
-	}
+	sc.Jobs[job].Queue = sc.resolveJobQueueID(sc.Jobs[job])
 
 	metrics.UpdateE2eSchedulingStartTimeByJob(sc.Jobs[job].Name, string(sc.Jobs[job].Queue), sc.Jobs[job].Namespace,
 		sc.Jobs[job].CreationTimestamp.Time)
@@ -928,9 +925,9 @@ func (sc *SchedulerCache) AddQueueV1beta1(obj interface{}) {
 		return
 	}
 
-	queue := &scheduling.Queue{}
-	if err := scheme.Scheme.Convert(ss, queue, nil); err != nil {
-		klog.Errorf("Failed to convert queue from %T to %T", ss, queue)
+	qi, err := buildClusterQueueInfo(ss)
+	if err != nil {
+		klog.Errorf("Failed to convert queue from %T to queue info: %v", ss, err)
 		return
 	}
 
@@ -938,7 +935,25 @@ func (sc *SchedulerCache) AddQueueV1beta1(obj interface{}) {
 	defer sc.Mutex.Unlock()
 
 	klog.V(4).Infof("Add Queue(%s) into cache, spec(%#v)", ss.Name, ss.Spec)
-	sc.addQueue(queue)
+	sc.upsertQueue(qi)
+}
+
+// AddNamespaceQueueV1beta1 add namespace queue to scheduler cache
+func (sc *SchedulerCache) AddNamespaceQueueV1beta1(obj interface{}) {
+	ss, ok := obj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		klog.Errorf("Cannot convert to *schedulingv1beta1.NamespaceQueue: %v", obj)
+		return
+	}
+
+	qi := schedulingapi.NewNamespaceQueueInfo(ss)
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+
+	klog.V(4).Infof("Add NamespaceQueue(%s/%s) into cache, spec(%#v)", ss.Namespace, ss.Name, ss.Spec)
+	sc.upsertQueue(qi)
+	sc.resolveJobsForNamespaceQueue(ss.Namespace, ss.Name)
 }
 
 // UpdateQueueV1beta1 update queue to scheduler cache
@@ -958,15 +973,38 @@ func (sc *SchedulerCache) UpdateQueueV1beta1(oldObj, newObj interface{}) {
 		return
 	}
 
-	newQueue := &scheduling.Queue{}
-	if err := scheme.Scheme.Convert(newSS, newQueue, nil); err != nil {
-		klog.Errorf("Failed to convert queue from %T to %T", newSS, newQueue)
+	qi, err := buildClusterQueueInfo(newSS)
+	if err != nil {
+		klog.Errorf("Failed to convert queue from %T to queue info: %v", newSS, err)
 		return
 	}
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
-	sc.updateQueue(newQueue)
+	sc.upsertQueue(qi)
+}
+
+// UpdateNamespaceQueueV1beta1 updates namespace queue in scheduler cache.
+func (sc *SchedulerCache) UpdateNamespaceQueueV1beta1(oldObj, newObj interface{}) {
+	oldSS, ok := oldObj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		klog.Errorf("Cannot convert oldObj to *schedulingv1beta1.NamespaceQueue: %v", oldObj)
+		return
+	}
+	newSS, ok := newObj.(*schedulingv1beta1.NamespaceQueue)
+	if !ok {
+		klog.Errorf("Cannot convert newObj to *schedulingv1beta1.NamespaceQueue: %v", newObj)
+		return
+	}
+	if oldSS.ResourceVersion == newSS.ResourceVersion {
+		return
+	}
+
+	qi := schedulingapi.NewNamespaceQueueInfo(newSS)
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+	sc.upsertQueue(qi)
 }
 
 // DeleteQueueV1beta1 delete queue from the scheduler cache
@@ -989,23 +1027,91 @@ func (sc *SchedulerCache) DeleteQueueV1beta1(obj interface{}) {
 
 	sc.Mutex.Lock()
 	defer sc.Mutex.Unlock()
-	sc.deleteQueue(schedulingapi.QueueID(ss.Name))
+	sc.deleteQueueByID(schedulingapi.QueueID(queueutil.ClusterKey(ss.Name)))
+}
+
+// DeleteNamespaceQueueV1beta1 delete namespace queue from scheduler cache.
+func (sc *SchedulerCache) DeleteNamespaceQueueV1beta1(obj interface{}) {
+	var ss *schedulingv1beta1.NamespaceQueue
+	switch t := obj.(type) {
+	case *schedulingv1beta1.NamespaceQueue:
+		ss = t
+	case cache.DeletedFinalStateUnknown:
+		var ok bool
+		ss, ok = t.Obj.(*schedulingv1beta1.NamespaceQueue)
+		if !ok {
+			klog.Errorf("Cannot convert to *schedulingv1beta1.NamespaceQueue: %v", t.Obj)
+			return
+		}
+	default:
+		klog.Errorf("Cannot convert to *schedulingv1beta1.NamespaceQueue: %v", obj)
+		return
+	}
+
+	sc.Mutex.Lock()
+	defer sc.Mutex.Unlock()
+	sc.deleteQueueByID(schedulingapi.QueueID(queueutil.NamespaceKey(ss.Namespace, ss.Name)))
+	sc.resolveJobsForNamespaceQueue(ss.Namespace, ss.Name)
 }
 
 func (sc *SchedulerCache) addQueue(queue *scheduling.Queue) {
-	qi := schedulingapi.NewQueueInfo(queue)
-	sc.Queues[qi.UID] = qi
+	sc.upsertQueue(schedulingapi.NewQueueInfo(queue))
 }
 
-func (sc *SchedulerCache) updateQueue(queue *scheduling.Queue) {
-	sc.addQueue(queue)
+func (sc *SchedulerCache) upsertQueue(queueInfo *schedulingapi.QueueInfo) {
+	sc.Queues[queueInfo.UID] = queueInfo
 }
 
-func (sc *SchedulerCache) deleteQueue(id schedulingapi.QueueID) {
+func (sc *SchedulerCache) deleteQueueByID(id schedulingapi.QueueID) {
 	if queue, ok := sc.Queues[id]; ok {
 		delete(sc.Queues, id)
 		metrics.DeleteQueueMetrics(queue.Name)
 	}
+}
+
+// resolveJobQueueID returns the canonical scheduler queue key for a job based on
+// the current queue objects visible in the cache.
+// Assumes sc.Mutex is already held by the caller.
+func (sc *SchedulerCache) resolveJobQueueID(job *schedulingapi.JobInfo) schedulingapi.QueueID {
+	if job == nil || job.PodGroup == nil {
+		return ""
+	}
+
+	queueName := job.PodGroup.Spec.Queue
+	if len(queueName) == 0 {
+		return schedulingapi.QueueID(queueutil.ClusterKey(sc.defaultQueue))
+	}
+
+	namespaceQueueID := schedulingapi.QueueID(queueutil.NamespaceKey(job.PodGroup.Namespace, queueName))
+	if _, found := sc.Queues[namespaceQueueID]; found {
+		return namespaceQueueID
+	}
+
+	return schedulingapi.QueueID(queueutil.ClusterKey(queueName))
+}
+
+// resolveJobsForNamespaceQueue updates cached jobs that reference the same
+// namespace/name queue target so they follow namespace-first resolution.
+// Assumes sc.Mutex is already held by the caller.
+func (sc *SchedulerCache) resolveJobsForNamespaceQueue(namespace, queueName string) {
+	for _, job := range sc.Jobs {
+		if job == nil || job.PodGroup == nil {
+			continue
+		}
+		if job.PodGroup.Namespace != namespace || job.PodGroup.Spec.Queue != queueName {
+			continue
+		}
+
+		job.Queue = sc.resolveJobQueueID(job)
+	}
+}
+
+func buildClusterQueueInfo(queue *schedulingv1beta1.Queue) (*schedulingapi.QueueInfo, error) {
+	effective := &scheduling.Queue{}
+	if err := scheme.Scheme.Convert(queue, effective, nil); err != nil {
+		return nil, err
+	}
+	return schedulingapi.NewQueueInfo(effective), nil
 }
 
 // DeletePriorityClass delete priorityclass from the scheduler cache

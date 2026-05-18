@@ -90,6 +90,7 @@ webhooks:
           - CREATE
         resources:
           - queues
+          - namespacequeues
         scope: '*'
     sideEffects: NoneOnDryRun
     timeoutSeconds: 10
@@ -381,6 +382,7 @@ webhooks:
           - DELETE
         resources:
           - queues
+          - namespacequeues
         scope: '*'
     sideEffects: NoneOnDryRun
     timeoutSeconds: 10

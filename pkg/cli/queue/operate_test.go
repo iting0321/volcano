@@ -20,12 +20,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"testing"
 
+	busv1alpha1 "volcano.sh/apis/pkg/apis/bus/v1alpha1"
 	"volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	queueutil "volcano.sh/volcano/pkg/queue"
 
 	"github.com/spf13/cobra"
 
@@ -33,46 +36,121 @@ import (
 )
 
 func TestOperateQueue(t *testing.T) {
-	response := v1beta1.Queue{
+	clusterQueueResponse := v1beta1.Queue{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-queue",
+			UID:  "cluster-uid",
+		},
+	}
+	namespaceQueueResponse := v1beta1.NamespaceQueue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-namespace-queue",
+			Namespace: "test-ns",
+			UID:       "namespace-uid",
 		},
 	}
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		val, err := json.Marshal(response)
-		if err == nil {
-			w.Write(val)
-		}
-	})
 
-	server := httptest.NewServer(handler)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/apis/scheduling.volcano.sh/v1beta1/queues/test-queue":
+			_ = json.NewEncoder(w).Encode(clusterQueueResponse)
+		case r.Method == http.MethodGet && r.URL.Path == "/apis/scheduling.volcano.sh/v1beta1/namespaces/test-ns/namespacequeues/test-namespace-queue":
+			_ = json.NewEncoder(w).Encode(namespaceQueueResponse)
+		case r.Method == http.MethodPatch && r.URL.Path == "/apis/scheduling.volcano.sh/v1beta1/queues/test-queue":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("failed to read cluster queue patch body: %v", err)
+			}
+			if string(body) != `{"spec":{"weight":3}}` {
+				t.Fatalf("unexpected cluster queue patch body: %s", string(body))
+			}
+			_ = json.NewEncoder(w).Encode(clusterQueueResponse)
+		case r.Method == http.MethodPatch && r.URL.Path == "/apis/scheduling.volcano.sh/v1beta1/namespaces/test-ns/namespacequeues/test-namespace-queue":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("failed to read namespace queue patch body: %v", err)
+			}
+			if string(body) != `{"spec":{"weight":3}}` {
+				t.Fatalf("unexpected namespace queue patch body: %s", string(body))
+			}
+			_ = json.NewEncoder(w).Encode(namespaceQueueResponse)
+		case r.Method == http.MethodPost && r.URL.Path == "/apis/bus.volcano.sh/v1alpha1/namespaces/default/commands":
+			var cmd busv1alpha1.Command
+			if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+				t.Fatalf("failed to decode command: %v", err)
+			}
+
+			switch cmd.TargetObject.Name {
+			case "test-queue":
+				if cmd.TargetObject.Kind != "Queue" {
+					t.Fatalf("unexpected cluster queue target kind: %s", cmd.TargetObject.Kind)
+				}
+			case queueutil.NamespaceKey("test-ns", "test-namespace-queue"):
+				if cmd.TargetObject.Kind != "Queue" {
+					t.Fatalf("unexpected namespace queue target kind: %s", cmd.TargetObject.Kind)
+				}
+				if len(cmd.OwnerReferences) != 0 {
+					t.Fatalf("namespace queue command should not set owner references")
+				}
+			default:
+				t.Fatalf("unexpected command target name: %s", cmd.TargetObject.Name)
+			}
+
+			_ = json.NewEncoder(w).Encode(cmd)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
 	defer server.Close()
 
 	operateQueueFlags.Master = server.URL
 	testCases := []struct {
 		Name        string
 		QueueName   string
+		Namespace   string
 		Weight      int32
 		Action      string
 		ExpectValue error
 	}{
 		{
-			Name:        "Normal Case Operate Queue Succeed, Action close",
-			QueueName:   "normal-case-action-close",
+			Name:        "Normal Case Operate Cluster Queue Succeed, Action close",
+			QueueName:   "test-queue",
 			Action:      ActionClose,
 			ExpectValue: nil,
 		},
 		{
-			Name:        "Normal Case Operate Queue Succeed, Action open",
-			QueueName:   "normal-case-action-open",
+			Name:        "Normal Case Operate Cluster Queue Succeed, Action open",
+			QueueName:   "test-queue",
 			Action:      ActionOpen,
 			ExpectValue: nil,
 		},
 		{
-			Name:        "Normal Case Operate Queue Succeed, Update Weight",
-			QueueName:   "normal-case-update-weight",
+			Name:        "Normal Case Operate Cluster Queue Succeed, Update Weight",
+			QueueName:   "test-queue",
+			Action:      ActionUpdate,
+			Weight:      3,
+			ExpectValue: nil,
+		},
+		{
+			Name:        "Normal Case Operate Namespace Queue Succeed, Action close",
+			QueueName:   "test-namespace-queue",
+			Namespace:   "test-ns",
+			Action:      ActionClose,
+			ExpectValue: nil,
+		},
+		{
+			Name:        "Normal Case Operate Namespace Queue Succeed, Action open",
+			QueueName:   "test-namespace-queue",
+			Namespace:   "test-ns",
+			Action:      ActionOpen,
+			ExpectValue: nil,
+		},
+		{
+			Name:        "Normal Case Operate Namespace Queue Succeed, Update Weight",
+			QueueName:   "test-namespace-queue",
+			Namespace:   "test-ns",
 			Action:      ActionUpdate,
 			Weight:      3,
 			ExpectValue: nil,
@@ -106,6 +184,7 @@ func TestOperateQueue(t *testing.T) {
 
 	for _, testCase := range testCases {
 		operateQueueFlags.Name = testCase.QueueName
+		operateQueueFlags.Namespace = testCase.Namespace
 		operateQueueFlags.Action = testCase.Action
 		operateQueueFlags.Weight = testCase.Weight
 
@@ -122,6 +201,9 @@ func TestInitOperateFlags(t *testing.T) {
 
 	if cmd.Flag("name") == nil {
 		t.Errorf("Could not find the flag name")
+	}
+	if cmd.Flag("namespace") == nil {
+		t.Errorf("Could not find the flag namespace")
 	}
 	if cmd.Flag("weight") == nil {
 		t.Errorf("Could not find the flag weight")
